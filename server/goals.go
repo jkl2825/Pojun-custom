@@ -198,7 +198,7 @@ func (s *Server) admitTaskWhen(t *Task, mode string, requireResumable bool) (que
 	}
 	if wasTerminal {
 		// 先停掉上一轮的协调器，再提交新状态，避免旧 deadline 抢先收掉续跑。
-		s.engine.stopDeadlineCoordinator(t.ID)
+		s.engine.coordStarted.Delete(t.ID)
 	}
 
 	status := lifecycle.Status
@@ -216,13 +216,18 @@ func (s *Server) admitTaskWhen(t *Task, mode string, requireResumable bool) (que
 		}
 		return false, err
 	}
-	if wasTerminal {
-		// 终态续跑使用新预算，持久化时钟已随准入一起清零。清理所有旧收尾门，
-		// 原 planner/worker 循环会在获准后继续，无需重建并行的调度循环。
-		s.engine.resetTerminalRevival(t)
-		if err := s.m.pg.DeleteTaskProgress(t.ID); err != nil {
-			log.Printf("[auto-finish] task %s 复活时重置本轮进度失败: %v", t.ID, err)
-		}
+	if wasTerminal && status == "running" {
+		// 终态复活（timeout/done/failed）统一清 Engine 侧的 per-run 闸门：
+		// ApplyTaskAdmission 已把 first_run_at/deadline_at 清零（旧一轮预算已耗尽，
+		// 复活的跟进工作拿全新预算），这里同步清 settling/deadline/stamped/coordStarted。
+		// 不清的话：timeout 复活会被残留 settling 卡住所有 worker；done 复活则会让
+		// 新起的 deadline 协调器拿过期 deadline 当场再收尾一次，人工跟进意图
+		// （如「深入漏洞」）被静默吞掉（任务 13，2026-11-05 实证）。
+		s.engine.resetTerminalRevival(t.ID)
+		// 上一轮生命周期遗留的挂起收尾请求同样作废——否则复活的第一个规划轮
+		// 会先消费它，把刚复活的任务又收一遍。
+		t.clearSettle()
+		log.Printf("[admission] task %s 从终态 %q 复活，超时预算已重置", t.ID, lifecycle.Status)
 	}
 	if shouldQueue {
 		if !wasQueued {
@@ -271,8 +276,9 @@ func (s *Server) startAdmittedTask(t *Task, mode string) {
 	}
 	s.engine.Run(s.ctx, t)
 	s.engine.Resume(t)
-	// Run 对已有循环只发唤醒；终态复活已停掉旧协调器，在这里确保新一轮协调器存在。
-	// 下一次真实 Planner/Worker 调用会盖章新的 deadline。
+	// Run returns early for an already-started task. Explicitly ensure a timeout
+	// coordinator exists after resume; resetTerminalRevival cleared the completed
+	// coordinator's marker and the next real call will stamp a fresh deadline.
 	s.engine.startDeadlineCoordinator(s.ctx, t)
 }
 

@@ -114,13 +114,14 @@ for pkg in wafw00f semgrep pwntools; do
 done
 
 # ── impacket 专用安装 ─────────────────────────────
-# 必须从 GitHub 源码装：PyPI wheel 只带库+少数示例，且 0.12 起不注册命令；
-# 源码 setup.py 会把 examples 全部注册成 impacket-smbexec/wmiexec/getST 等
-# 命令——渗透作业按这些命令名调用。源码装失败再退 wheel+wrapper 兜底。
+# PyPI 渠道全部不注册命令（wheel/sdist 的 0.11 与 0.12+ 均实测无 impacket-*
+# 脚本），而渗透作业按 impacket-smbexec/wmiexec/getST 这些命令名调用。
+# 策略：①codeload master 源码（examples 全量）安装；②无论 ① 成败，都从
+# examples 目录生成双名包装器（impacket-<名> 与 <名>），保证命令一定在。
 imp_ok=0
 rm -rf /tmp/impacket-src; mkdir -p /tmp/impacket-src
 for i in 1 2 3; do
-  # 不用 pip git+：那要构建机有 git；codeload tarball 走 release 同款 CDN，fetch 自带重试
+  # 不用 pip git+：那要构建机有 git；codeload tarball 走 CDN，fetch 自带重试
   if fetch "https://github.com/fortra/impacket/archive/refs/heads/master.tar.gz" /tmp/impacket-src/imp.tar.gz; then
     tar -xzf /tmp/impacket-src/imp.tar.gz -C /tmp/impacket-src 2>/dev/null || true
     d="$(find /tmp/impacket-src -maxdepth 1 -type d -name 'impacket-*' | head -1)"
@@ -130,19 +131,35 @@ for i in 1 2 3; do
   fi
   sleep 8
 done
-if [ "$imp_ok" = "1" ]; then
-  ok "  impacket（源码，含全套示例命令）"
-else
-  warn "  impacket 源码安装失败，退 PyPI wheel + wrapper"
-  python3 -m pip install --no-cache-dir --root-user-action=ignore impacket >/dev/null 2>&1 || true
-  exdir="$(python3 -c 'import impacket, os; print(os.path.join(os.path.dirname(impacket.__file__), "examples"))')" 2>/dev/null || exdir=""
-  if [ -n "$exdir" ] && [ -d "$exdir" ]; then
-    for s in secretsdump smbclient mssqlshell ldap_shell; do
-      [ -f "$exdir/$s.py" ] || continue
-      printf '#!/bin/sh\nexec python3 "%s/%s.py" "$@"\n' "$exdir" "$s" > "/usr/local/bin/impacket-$s"
-      chmod +x "/usr/local/bin/impacket-$s"
-    done
+[ "$imp_ok" = "1" ] && ok "  impacket（源码，含全套示例命令）"
+
+# 包装器兜底：优先用已装包的 examples 目录（源码/wheel 都带），若连 examples
+# 都没有（PyPI 拦截/网络全断），用 pip download 拉 sdist 解出 examples 再生成。
+gen_wrappers(){
+  local ex="$1" f base
+  for f in "$ex"/*.py; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f" .py)"
+    case "$base" in __init__|logger|utils|*_help) continue ;; esac
+    printf '#!/bin/sh\nexec python3 "%s/%s.py" "$@"\n' "$ex" "$base" > "/usr/local/bin/impacket-$base"
+    chmod +x "/usr/local/bin/impacket-$base"
+    command -v "$base" >/dev/null 2>&1 || cp "/usr/local/bin/impacket-$base" "/usr/local/bin/$base"
+  done
+}
+exdir="$(python3 -c 'import impacket, os; print(os.path.join(os.path.dirname(impacket.__file__), "examples"))')" 2>/dev/null || exdir=""
+if [ -z "$exdir" ] || [ -z "$(find "$exdir" -maxdepth 1 -name 'smbexec.py' 2>/dev/null)" ]; then
+  rm -rf /tmp/impsd; mkdir -p /tmp/impsd
+  if python3 -m pip download impacket --no-deps --no-binary :all: -d /tmp/impsd >/dev/null 2>&1; then
+    sd="$(find /tmp/impsd -name 'impacket-*.tar.gz' | head -1)"
+    [ -n "$sd" ] && tar -xzf "$sd" -C /tmp/impsd 2>/dev/null
+    exdir="$(find /tmp/impsd -type d -name examples | head -1)"
   fi
+fi
+if [ -n "$exdir" ] && [ -f "$exdir/smbexec.py" ]; then
+  gen_wrappers "$exdir"
+  ok "  impacket 示例命令包装器（impacket-smbexec / wmiexec / secretsdump …）"
+elif [ "$imp_ok" != "1" ]; then
+  warn "  impacket 命令不可用（PyPI 与 GitHub 均不可达；体检页会如实显示缺失）"
 fi
 
 # ── SecLists 字典集 ──────────────────────────────────

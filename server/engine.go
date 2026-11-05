@@ -318,7 +318,7 @@ func (e *Engine) StopTask(taskID string) {
 	e.deadline.Delete(taskID)
 	e.stamped.Delete(taskID)
 	e.inflight.Delete(taskID)
-	e.stopDeadlineCoordinator(taskID)
+	e.coordStarted.Delete(taskID)
 	e.deleteMu.Lock()
 	e.deleting.Delete(taskID)
 	e.deleteMu.Unlock()

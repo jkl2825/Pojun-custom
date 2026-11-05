@@ -147,3 +147,71 @@ func TestNewBuiltinSkillsAreBoundByDefault(t *testing.T) {
 		}
 	}
 }
+
+// 守门测试（v0.4.56）：仓库里发布的每个 skill 都必须有默认可见性绑定，
+// 否则它「存在但没人看得到」——这正是用户在 2026-11-05 反馈的问题：
+// redteam-ops / playwright-cli 等写了却从未绑定给任何 agent。
+//
+// 例外必须显式列在这里并写明原因，新增 skill 忘记绑定会直接红。
+func TestEveryShippedSkillIsBoundOrExplicitlyOptOut(t *testing.T) {
+	optOut := map[string]string{
+		"scopesentry": "依赖外部 ScopeSentry MCP 配置，按需开启",
+	}
+	dirs, err := os.ReadDir(filepath.Join("..", "skills"))
+	if err != nil {
+		t.Skip("找不到 skills 目录")
+	}
+	for _, d := range dirs {
+		if !d.IsDir() {
+			continue
+		}
+		name := d.Name()
+		if _, ok := optOut[name]; ok {
+			continue
+		}
+		if len(builtinSkillVisibility[name]) == 0 {
+			t.Errorf("skill %q 没有默认可见性绑定（也没在 optOut 里说明原因）——写了没人看得到", name)
+		}
+	}
+	// 反向：绑定表里的 key 必须真有这个 skill 目录（防改名后旧 key 悬空）。
+	for name := range builtinSkillVisibility {
+		if _, err := os.Stat(filepath.Join("..", "skills", name, "SKILL.md")); err != nil {
+			t.Errorf("可见性绑定的 skill %q 不存在于 skills/ 目录", name)
+		}
+	}
+}
+
+// src-hunting 是 SRC 场景的知识库入口：references/ 与 rules/ 必须随包完整分发，
+// 否则 SKILL.md 里的索引全是死链（模型打开文件失败，方法论就用不起来）。
+func TestSrcHuntingSkillShipsKnowledgeBase(t *testing.T) {
+	base := filepath.Join("..", "skills", "src-hunting")
+	entries, err := os.ReadDir(filepath.Join(base, "references"))
+	if err != nil {
+		t.Fatalf("src-hunting references 目录缺失: %v", err)
+	}
+	md := 0
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".md") {
+			md++
+			if info, err := e.Info(); err != nil || info.Size() < 100 {
+				t.Errorf("references/%s 为空或过小", e.Name())
+			}
+		}
+	}
+	if md < 40 {
+		t.Fatalf("知识库文件数 %d，少于预期 40+（分发不完整）", md)
+	}
+	rules, err := os.ReadDir(filepath.Join(base, "rules"))
+	if err != nil {
+		t.Fatalf("src-hunting rules 目录缺失: %v", err)
+	}
+	if len(rules) < 10 {
+		t.Fatalf("规则文件数 %d，少于预期 10+", len(rules))
+	}
+	// 入口必读文件
+	for _, f := range []string{"打穿短表.md", "recon-methodology.md"} {
+		if _, err := os.Stat(filepath.Join(base, "references", f)); err != nil {
+			t.Errorf("缺少入口文件 references/%s", f)
+		}
+	}
+}

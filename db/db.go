@@ -352,16 +352,37 @@ ON CONFLICT DO NOTHING`, r.kind, r.pattern, r.note); err != nil {
 // builtinSkillVisibility maps a shipped skill's directory name → the built-in
 // agent keys that should see it by default. The skill FILES themselves live on the
 // filesystem (SkillDir, loaded by norma at runtime); DB only carries this visibility
-// binding. Skills omitted here (e.g. playwright-cli, scopesentry) ship invisible by
-// default — the user turns them on per-agent when needed. scopesentry additionally
-// declares `mcps: ScopeSentry`, which only takes effect once it's made visible and
-// that MCP is enabled/configured.
+// binding. 绑定策略（v0.4.56 起）：执行类 skill（攻击手法/后渗透/验证/输出）
+// 默认绑给 worker 与 pentest；方向类 skill（情报/侦察/0day/代码审计）另绑 planner，
+// 因为「要不要往这个方向投入」是规划者的判断。scopesentry（平台集成）保持默认
+// 不可见——它依赖外部 MCP 配置，用户按需开启。ON CONFLICT DO NOTHING 保证
+// 用户此后的开关不会被重启复活。
 var builtinSkillVisibility = map[string][]string{
-	"api-recon": {"auto", "pentest", "worker"},
-	// vuln-hunting：主动漏洞挖掘方法论（七个维度：对象换位/流程拆解/状态机/
-	// 数据边界/资源假设/错误路径/组合）。绑给 planner（它决定派不派「挖未知
-	// 漏洞」类意图）与 worker（它执行这条意图时需要方法论）。
-	"vuln-hunting": {"planner", "worker"},
+	// 侦察与接口
+	"api-recon":            {"auto", "pentest", "worker"},
+	"attack-surface-recon": {"planner", "pentest", "worker"},
+	"api-security-testing": {"pentest", "worker"},
+	// 方法论与验证
+	"vuln-hunting":             {"planner", "worker"},
+	"web-attack-methods":       {"pentest", "worker"},
+	"component-vuln-intel":     {"planner", "pentest", "worker"},
+	"source-code-hunting":      {"planner", "pentest", "worker"},
+	"zero-day-research":        {"planner", "pentest", "worker"},
+	"pentest-verification":     {"pentest", "worker"},
+	"pentest-output-standards": {"pentest", "worker"},
+	// 场景专项
+	"redteam-ops":              {"pentest", "worker"},
+	"redteam-opsec":            {"pentest", "worker"},
+	"cloud-attack-methods":     {"pentest", "worker"},
+	"active-directory-attack":  {"pentest", "worker"},
+	"ai-llm-app-attack":        {"pentest", "worker"},
+	"binary-mobile-reversing":  {"pentest", "worker"},
+	"smart-contract-audit":     {"pentest", "worker"},
+	"wireless-hardware-attack": {"pentest", "worker"},
+	// SRC 方法论库（48 篇知识库 + 11 篇规则）：规划者定方向、执行者查细节
+	"src-hunting": {"planner", "pentest", "worker"},
+	// 浏览器自动化：worker 做 SPA/登录态探测时可用
+	"playwright-cli": {"pentest", "worker"},
 }
 
 // seedBuiltinSkillVisibility binds the shipped built-in skills to their default
@@ -527,9 +548,10 @@ func mergeEnabledInterceptTools(raw string, additions ...string) (string, bool) 
 // migrateBuiltinRulePatterns 把两条实测误报的内置规则换成收窄后的正则。
 //
 // 误报（全部来自生产环境的拦截历史，都是合法的渗透探测命令）：
-//   rm -f /tmp_out.$$                     → 命中「删除系统关键目录」（裸 / 分支）
-//   rm -f /usr/share/nmap/scripts/_t.nse  → 同上
-//   for p in /api/.../reboot ...          → 命中「关机 / 重启」（路径里的 reboot）
+//
+//	rm -f /tmp_out.$$                     → 命中「删除系统关键目录」（裸 / 分支）
+//	rm -f /usr/share/nmap/scripts/_t.nse  → 同上
+//	for p in /api/.../reboot ...          → 命中「关机 / 重启」（路径里的 reboot）
 //
 // 规则是 first-insert only 的 seed，改代码对已部署实例无效，所以用一次性迁移
 // 同步 pattern。**只改 pattern，不改 action/enabled/priority**——用户自己把

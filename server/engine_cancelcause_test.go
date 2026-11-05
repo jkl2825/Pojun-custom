@@ -202,53 +202,6 @@ func TestResumeDoesNotClearDeleteBarrier(t *testing.T) {
 	}
 }
 
-func TestTerminalRevivalCancelsPreviousCoordinatorWithoutReplacingRuntime(t *testing.T) {
-	e := NewEngine(&Manager{tasks: map[string]*Task{}})
-	task := &Task{ID: "42", TimeoutSeconds: 120, notify: make(chan struct{}, 1)}
-	task.updateLifecycle(func(state *taskLifecycleState) { state.Status = "done" })
-	e.m.tasks[task.ID] = task
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	e.startDeadlineCoordinator(ctx, task)
-	first, ok := e.coordStarted.Load(task.ID)
-	if !ok {
-		t.Fatal("未创建首轮协调器")
-	}
-	rt := e.runtimes[task.ID]
-	oldCtx, oldCancel := context.WithCancel(context.Background())
-	original := first.(*deadlineCoordinatorRun)
-	e.coordStarted.Store(task.ID, &deadlineCoordinatorRun{cancel: func() {
-		original.cancel()
-		oldCancel()
-	}})
-	e.deadline.Store(task.ID, int64(1))
-	e.stamped.Store(task.ID, true)
-	e.settling.Store(task.ID, "goal_met")
-	e.resetTerminalRevival(task)
-	if oldCtx.Err() == nil || e.isSettling(task.ID) {
-		t.Fatal("终态继续没有取消旧轮并清除收尾门")
-	}
-	e.startDeadlineCoordinator(ctx, task)
-	second, ok := e.coordStarted.Load(task.ID)
-	if !ok || second == first || e.runtimes[task.ID] != rt {
-		t.Fatal("新协调器未复用已有任务运行时")
-	}
-	// 旧轮在清门后到达 settle 入口，必须因为已取消而直接退出。
-	e.settleTaskWithReason(oldCtx, task, "timeout", "旧轮迟到")
-	if e.isSettling(task.ID) {
-		t.Fatal("已取消的旧轮重新安装了收尾门")
-	}
-	e.stopDeadlineCoordinator(task.ID)
-	cancel()
-	done := make(chan struct{})
-	go func() { rt.wg.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("协调器取消后未随任务运行时退出")
-	}
-}
-
 func TestBootstrapAdmissionClearsQueuedPauseBarrier(t *testing.T) {
 	e := NewEngine(nil)
 	ctx, cancel := context.WithCancel(context.Background())

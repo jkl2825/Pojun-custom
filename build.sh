@@ -195,6 +195,8 @@ package_binary() {
     chmod +x "$package_root/start.sh"
   fi
   cp -R skills "$package_root/"
+  # 平台自带的 MCP 服务器（FOFA 资产测绘）：相对路径由 start.sh 的 cwd 解析
+  [ -d mcp-servers ] && cp -R mcp-servers "$package_root/"
   cp config.example.json "$package_root/"
   if [ -f README.md ]; then cp README.md "$package_root/"; fi
   (cd "$POJUN_PACKAGE_DIR" && zip -q -r -9 "$(basename "$archive")" "$(basename "$package_root")")

@@ -4,6 +4,64 @@
 
 ## [Unreleased]
 
+## [0.4.56] - 2026-11-05
+
+> 技能与 MCP 大规模扩充（参考 CyberStrikeAI 的技能体系，结合平台自身工具链）：
+> 内置 skill 从 5 个扩到 21 个，新增 MCP 预设目录与 FOFA 资产测绘服务器。
+
+### 新增
+
+- **内置 skill 21 个**：新增 attack-surface-recon / web-attack-methods /
+  api-security-testing / component-vuln-intel / cloud-attack-methods /
+  active-directory-attack / source-code-hunting / zero-day-research /
+  ai-llm-app-attack / binary-mobile-reversing / smart-contract-audit /
+  wireless-hardware-attack / redteam-opsec / pentest-verification /
+  pentest-output-standards / src-hunting；redteam-ops 补齐 frontmatter 并扩写成
+  实战后渗透清单。
+- **SRC 方法论库（src-hunting）**：迁移完整的 48 篇测试知识库 + 11 篇流程规则，
+  SKILL.md 提供索引与平台工具映射，`${SKILL_DIR}` 按需打开，禁止通读；
+  知识库/规则随发行包与镜像分发。
+- **默认可见性绑定**：执行类 skill 绑 worker/pentest，方向类绑 planner——
+  此前 redteam-ops/playwright-cli 写了却从未绑定给任何 agent（用户 2026-11-05
+  反馈的「写了没人看得到」），并加守门测试防回退。
+- **MCP 预设目录**：MCP 页新增 9 个常用服务器一键填充（Playwright / Chrome
+  DevTools / Burp / Fetch / Sequential Thinking / Memory / Filesystem /
+  Context7 / FOFA）。
+- **FOFA 资产测绘 MCP**（mcp-servers/fofa）：官方三账号轮换 + one-fox 社区通道，
+  随发行包与 Docker 镜像分发；预设 `uv --directory mcp-servers/fofa run python
+  fofa.py`；.env 模板只给占位符，密钥不入仓库。
+
+### 修复
+
+- redteam-ops 缺 YAML frontmatter，导致 CI 连续红灯（skill 加载后 description
+  为空）；已补齐并纳入守门测试。
+
+### 验证
+
+- FOFA MCP 端到端实测：stdio 握手 → tools/list（get_alerts/get_alerts_onefox）
+  → one-fox 通道真实查询返回；官方通道 key 受限时自动提示/shift；
+- skill 加载与绑定守门测试全绿；全仓回归通过。
+
+## [0.4.55] - 2026-11-05
+
+> 任务 13 事故修复：「深入漏洞」人工跟进意图被任务终局收尾静默吞掉。
+> 时间线实证：16:36:16 跟进意图 #7470 创建 → 16:36:17 终局判定轮启动 →
+> 「全部目标已 met，按终局收尾指令不新增意图，本轮收束」→ 任务 timeout。
+
+### 修复
+
+- **终态复活重置超时预算**（根因）：任务 11-04 因「目标已全部达成」落 done，
+  但 first_run_at/deadline_at 仍停在 11-04 的 8 小时预算（18:02 已过期）。
+  11-05 人工跟进把 done 复活为 running 时，旧代码只对 timeout 复活重置时钟 →
+  新起的 deadline 协调器读到已过期 deadline，1 秒后再次收尾，跟进意图从未被
+  worker 领取。现在任何终态（done/failed/timeout）复活都清空
+  first_run_at/deadline_at，下一次真实运行重新盖章整套预算。
+- **Engine per-run 闸门同口径清理**：resetTimeoutRevival → resetTerminalRevival，
+  覆盖 settling/deadline/stamped/coordStarted 四项，复活任务不再被残留标志卡住。
+- **复活时清挂起收尾请求**：上一轮生命周期遗留的 pendingSettle 作废，避免复活后
+  第一个规划轮先消费它又收一遍。
+- 回归测试：done 复活后 DB/内存双时钟清零 + 重新盖章得到从现在起算的新预算。
+
 ## [0.4.54] - 2026-11-05
 
 > Docker 镜像内置工具补齐：此前镜像只有 recon 基础件（nmap/nuclei/

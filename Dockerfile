@@ -73,6 +73,10 @@ RUN fc-cache -f /usr/share/fonts/gongwen >/dev/null 2>&1 || true
 # projectdiscovery 全家桶 / gobuster / gitleaks / chisel / amass / dalfox /
 # feroxbuster + pip 组（wafw00f/netexec/semgrep/pwntools）+ SecLists → /opt/SecLists
 COPY docker/install-tools.sh /tmp/install-tools.sh
+# 平台自带的 MCP 服务器（FOFA 资产测绘等）；相对路径由 start.sh 的 cwd(/app) 解析
+COPY mcp-servers/ /app/mcp-servers/
+# uv：MCP 预设「FOFA 资产测绘」用它拉起 Python stdio server
+RUN python3 -m pip install --no-cache-dir --quiet uv && uv --version
 RUN bash /tmp/install-tools.sh && rm -f /tmp/install-tools.sh
 # data/（SQLite + jwt.key）持久化点
 VOLUME ["/app/data"]

@@ -1457,6 +1457,12 @@ func (m *Manager) SetTaskPaused(id string, paused bool) error {
 // prevents a failed resume from leaving a task half-revived (for example running
 // but still user-paused, or dequeued without an Engine start).
 //
+// Terminal revival (expectedStatus done/failed/timeout → running) resets
+// first_run_at/deadline_at: the old run's wall-clock budget is spent, and the
+// revived work (human follow-up intent / new goals) deserves a fresh one.
+// Without this, a task revived hours after its deadline makes the deadline
+// coordinator settle it again within seconds — silently swallowing the new work.
+//
 // preservePosition applies only when the row is already queued. A repeated
 // admission keeps its FIFO timestamp; a task that was explicitly paused and is
 // now re-queued receives a fresh tail position.

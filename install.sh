@@ -1011,7 +1011,8 @@ install_pip_tools(){
   # pipx 对已装的包会报错退出，不该当成"安装失败"。
   local specs="wafw00f|wafw00f
 semgrep|semgrep
-pwntools|pwntools"
+pwntools|pwntools
+uv|uv"
   # netexec 不装：NetExec 2026 起商业化，PyPI 发行文件已撤下（装必失败）；
 # 需要时从 GitHub 源码安装（hosttools netexec 条目有说明）。
   local spec pkg bin
