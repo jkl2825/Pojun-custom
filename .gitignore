@@ -68,3 +68,6 @@ peers/
 /DEPLOY-本地部署说明.md
 /.workbuddy/
 /ops/*.log
+
+# 本地配置备份（可能含凭据），一律不入库
+.env.bak*
