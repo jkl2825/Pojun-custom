@@ -91,3 +91,45 @@ VALUES ($1,$2,$3,$4,'ev',$5)`, taskID, class, name, summary, status); err != nil
 		t.Fatalf("召回结果不符：%+v", entries)
 	}
 }
+
+// TestTaskSubmitConfigRoundTrip 守住提交通道的存取契约：
+// 写入后可读出，清空后读取返回 nil（= submit_flag 不再注册）。
+func TestTaskSubmitConfigRoundTrip(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+
+	expID, err := d.CreateExploration("submit-config-test", "验证提交通道存取")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var taskID int64
+	if err := d.QueryRow(`INSERT INTO tasks(name, description, goal, exploration_id, status)
+VALUES ('sc','','',$1,'created') RETURNING id`, expID).Scan(&taskID); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		d.Exec(`DELETE FROM tasks WHERE id=$1`, taskID)
+		d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	}()
+
+	if cfg := d.TaskSubmitConfig(taskID); cfg != nil {
+		t.Fatalf("新建任务不应有通道，实际 %+v", cfg)
+	}
+	want := map[string]string{"url": "http://t.local/api/submit", "agent": "a1", "token": "t1"}
+	if err := d.SetTaskSubmitConfig(taskID, want); err != nil {
+		t.Fatal(err)
+	}
+	got := d.TaskSubmitConfig(taskID)
+	if got["url"] != want["url"] || got["agent"] != want["agent"] || got["token"] != want["token"] {
+		t.Fatalf("回读不符: %+v", got)
+	}
+	if err := d.SetTaskSubmitConfig(taskID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := d.TaskSubmitConfig(taskID); cfg != nil {
+		t.Fatalf("清空后应返回 nil，实际 %+v", cfg)
+	}
+}

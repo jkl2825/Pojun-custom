@@ -829,6 +829,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tokens/usage", s.pgUsageStats)            // 全局 llm_usage 聚合（仪表盘新版视图）
 	mux.HandleFunc("GET /api/tokens/cost", s.pgUsageCost)              // 成本估算（内置参考价，?task= 看单任务）
 	mux.HandleFunc("POST /api/tasks/{id}/auth-check", s.taskAuthCheck) // 登录凭据自检（真实发一次登录请求）
+	// 提交通道：创建时写入之外，运行中可以改（换 token / 停用）。
+	// 只有发起方能改，agent 无路径——这是「裁决权不在被验证方手里」的前提。
+	mux.HandleFunc("PUT /api/tasks/{id}/submit-config", s.taskSubmitConfigPut)
+	mux.HandleFunc("DELETE /api/tasks/{id}/submit-config", s.taskSubmitConfigDelete)
 	// 证据附件（v0.5.0）：列表 / 单文件下载 / 证据包 zip。
 	mux.HandleFunc("GET /api/tasks/{id}/artifacts", s.listTaskArtifacts)
 	mux.HandleFunc("PATCH /api/tasks/{id}/artifacts/{aid}", s.patchTaskArtifact)    // 改归属（任务级 ↔ 漏洞）
@@ -1551,6 +1555,9 @@ type createTaskReq struct {
 	CoverageEnabled      *bool    `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
+	// SubmitConfig 夺旗类交战的裁决通道（url/agent/token/display_name）。
+	// 由创建方写入，agent 不可见；存在则注册 submit_flag，缺省则工具不存在。
+	SubmitConfig map[string]string `json:"submit_config,omitempty"`
 	// AuthConfig 任务级目标登录凭据（v0.4.8）：worker 先登录再测；创建后可用
 	// POST /api/tasks/{id}/auth-check 做一次登录自检。密码/TOTP 只进 DB。
 	AuthConfig *db.TaskAuthConfig `json:"auth_config,omitempty"`
@@ -1630,6 +1637,19 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		}
 		writeErr(w, 500, err.Error())
 		return
+	}
+	// 裁决通道：必须在 launchTask 之前落库——首轮 worker 一起来就会读它决定
+	// 是否注册 submit_flag；晚一步写，第一个 worker 就没有提交能力。
+	if cfg, err := normalizeSubmitConfig(req.SubmitConfig); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	} else if len(cfg) > 0 {
+		if tid, perr := strconv.ParseInt(t.ID, 10, 64); perr == nil {
+			if err := s.m.pg.SetTaskSubmitConfig(tid, cfg); err != nil {
+				writeErr(w, 500, "提交通道写入失败: "+err.Error())
+				return
+			}
+		}
 	}
 	log.Printf("[task] 新建任务 #%s «%s» 目标: %s", t.ID, req.Description, req.Goal)
 	// 共享的建后流程(seed + 种子意图 + 后台目标分解 + engine.Run),与 spawn_task 复用同一段。
@@ -4364,4 +4384,82 @@ func zipDocxFiles(stage, zipPath string) (err error) {
 		}
 	}
 	return nil
+}
+
+// normalizeSubmitConfig 校验并规整提交通道配置。
+//
+// 只校验「能不能用」的最低条件（地址形式），不校验凭据真伪——凭据对不对
+// 由外部计分方在提交时裁决，这里假装能验证只会掩盖问题。
+func normalizeSubmitConfig(in map[string]string) (map[string]string, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	out := map[string]string{}
+	for k, v := range in {
+		if v = strings.TrimSpace(v); v != "" {
+			out[k] = v
+		}
+	}
+	url := out["url"]
+	if url == "" {
+		return nil, fmt.Errorf("提交通道缺少 url")
+	}
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		return nil, fmt.Errorf("提交通道 url 必须以 http:// 或 https:// 开头")
+	}
+	// agent/token 成对出现：只给 token 没有 agent 时外部平台无法识别身份，
+	// 与其在运行期报 403 再排查，不如在创建时就拒。
+	if (out["agent"] == "") != (out["token"] == "") {
+		return nil, fmt.Errorf("提交通道的 agent 与 token 必须同时提供")
+	}
+	return out, nil
+}
+
+// taskSubmitConfigPut 更新任务的提交通道；传空配置等同清除。
+// PUT /api/tasks/{id}/submit-config
+func (s *Server) taskSubmitConfigPut(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || s.m.PG() == nil {
+		writeErr(w, 400, "invalid task id")
+		return
+	}
+	var req struct {
+		SubmitConfig map[string]string `json:"submit_config"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "bad json: "+err.Error())
+		return
+	}
+	cfg, err := normalizeSubmitConfig(req.SubmitConfig)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	t, err := s.m.PG().GetTask(id)
+	if err != nil || t == nil {
+		writeErr(w, 404, "task not found")
+		return
+	}
+	if err := s.m.PG().SetTaskSubmitConfig(id, cfg); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	// 运行中的 worker 在下一轮才会重新装配工具集：这里提示调用方，
+	// 避免以为「存了立刻生效」。
+	writeJSON(w, 200, map[string]any{"ok": true, "enabled": len(cfg) > 0})
+}
+
+// taskSubmitConfigDelete 停用任务的提交通道（submit_flag 随之不再注册）。
+// DELETE /api/tasks/{id}/submit-config
+func (s *Server) taskSubmitConfigDelete(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || s.m.PG() == nil {
+		writeErr(w, 400, "invalid task id")
+		return
+	}
+	if err := s.m.PG().SetTaskSubmitConfig(id, nil); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "enabled": false})
 }

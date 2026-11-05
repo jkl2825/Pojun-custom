@@ -667,6 +667,24 @@ DELETE FROM assets a USING deletable d WHERE a.id=d.id`, id, expID)
 	return result, tx.Commit()
 }
 
+// SetTaskSubmitConfig 写入任务级提交通道配置；空配置等价于清除通道
+// （清除后 submit_flag 在该任务上不再注册）。
+//
+// 只接受创建任务的调用方（API/运维）写入，agent 侧没有任何路径能改它——
+// 这是「裁决权不在被验证方手里」的前提，破坏它整套验收就退化成自我声明。
+func (d *DB) SetTaskSubmitConfig(taskID int64, cfg map[string]string) error {
+	if len(cfg) == 0 {
+		_, err := d.Exec(`UPDATE tasks SET submit_config=NULL, updated_at=now() WHERE id=$1`, taskID)
+		return err
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	_, err = d.Exec(`UPDATE tasks SET submit_config=$2, updated_at=now() WHERE id=$1`, taskID, raw)
+	return err
+}
+
 // TaskSubmitConfig 读取任务级提交通道配置（submit_config jsonb）。
 //
 // 为什么放在任务上而不是全局设置：平台是多交战的，全局 token 会让一个靶场的
