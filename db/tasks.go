@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -664,4 +665,29 @@ DELETE FROM assets a USING deletable d WHERE a.id=d.id`, id, expID)
 		return result, err
 	}
 	return result, tx.Commit()
+}
+
+// TaskSubmitConfig 读取任务级提交通道配置（submit_config jsonb）。
+//
+// 为什么放在任务上而不是全局设置：平台是多交战的，全局 token 会让一个靶场的
+// 凭据管住所有任务；也不能由 agent 写入——验收通道的地址必须来自交战发起方，
+// 否则模型可以指向自己起一个永远返回 200 的服务，验收就退回自我声明。
+//
+// 返回 nil 表示该任务没有提交通道：调用方据此不注册 submit_flag 工具。
+func (d *DB) TaskSubmitConfig(taskID int64) map[string]string {
+	var raw []byte
+	if err := d.QueryRow(`SELECT submit_config FROM tasks WHERE id=$1`, taskID).Scan(&raw); err != nil {
+		return nil
+	}
+	if len(raw) == 0 {
+		return nil
+	}
+	out := map[string]string{}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil
+	}
+	if strings.TrimSpace(out["url"]) == "" {
+		return nil
+	}
+	return out
 }

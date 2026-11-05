@@ -55,6 +55,7 @@ type WebSearchOpts struct {
 
 type Worker struct {
 	findingRecorder FindingRecorder
+	flagSubmitter   FlagSubmitter // 夺旗类交战的裁决通道；nil = 不注册 submit_flag
 	// artifactRecorder 由 host 注入：证据附件（截图/样本/日志）落盘登记。
 	artifactRecorder ArtifactRecorder
 	prov             llm.Provider
@@ -160,6 +161,9 @@ func (w *Worker) SetTaskAuthBlock(block string) { w.taskAuthBlock = block }
 
 // SetArtifactRecorder 注入证据附件存储（host 实现）。
 func (w *Worker) SetArtifactRecorder(r ArtifactRecorder) { w.artifactRecorder = r }
+
+// SetFlagSubmitter 注入夺旗裁决通道；nil 表示本任务没有提交通道。
+func (w *Worker) SetFlagSubmitter(s FlagSubmitter) { w.flagSubmitter = s }
 
 // settleWrapUpPrompt is injected by the SDK settlement phase when a worker hits its
 // turn/time budget: stop probing, write back what was found, then end with a
@@ -720,6 +724,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	}
 	tsx := NewToolSet(ts, name)
 	tsx.SetFindingRecorder(w.findingRecorder)
+	tsx.SetFlagSubmitter(w.flagSubmitter) // nil = 工具不注册
 	tsx.SetTaskID(taskID)
 	coverageEnabled := as == nil || as.CoverageEnabled(taskID)
 	tsx.SetCoverageEnabled(coverageEnabled)

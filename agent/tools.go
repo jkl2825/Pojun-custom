@@ -92,6 +92,8 @@ type ToolSet struct {
 	cs     *db.CompanyStore // company store (optional)
 	ts     *db.ExplorationStore
 	worker string
+	// submitter 是夺旗类交战的裁决通道；nil = 本任务无提交通道（submit_flag 不注册）。
+	submitter FlagSubmitter
 	taskID int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
 	// coverageDisabled mirrors tasks.coverage_enabled=false. Stored inverted so the
 	// zero value (all existing ToolSet constructions) means ENABLED — matching the

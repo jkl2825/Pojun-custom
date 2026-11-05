@@ -560,6 +560,9 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queued_at TIMESTAMPTZ;
 -- 任务级目标登录凭据（v0.4.8）：worker 先登录再测；password/totp_secret 只在
 -- DB 内保存，任何 API 响应都脱敏（见 db/task_auth.go）。NULL=未配置。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS auth_config JSONB;
+-- 夺旗/评测类交战的提交通道（任务级，由创建方写入，agent 不可写）。
+-- 存在即注册 submit_flag 工具；不存在则该工具在此任务上完全不可见。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS submit_config JSONB;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queue_mode TEXT NOT NULL DEFAULT '';
 -- 可选的任务名称;补旧库。空串=未命名,前端展示时回退到描述。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT '';

@@ -701,6 +701,12 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk := agent.NewWorker(workerRuntime, "task-router", s.m.dir, tx, window, s.agentMaxTurns("worker"))
 	wk.SetFindingRecorder(s.evidenceStore())
 	wk.SetArtifactRecorder(s) // v0.5.0 证据附件：save_evidence 落盘登记
+	// 夺旗类交战：任务配了提交通道才注入 submit_flag；未配置则该工具不存在。
+	if tid, err := t.Store.TaskID(); err == nil {
+		if cfg := s.m.pg.TaskSubmitConfig(tid); cfg != nil {
+			wk.SetFlagSubmitter(newFlagSubmitter(cfg))
+		}
+	}
 	wk.SetCompactionWindowResolver(workerRuntime.CompactionWindow)
 	wk.SetNonStreaming(workerRuntime.nonStreaming) // 按任务当前激活 profile 的流式开关(每轮读)
 	wk.SetMaxTokens(workerRuntime.maxTokens)       // 同上,输出上限也跟随当前激活 profile
