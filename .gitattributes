@@ -1,4 +1,19 @@
-* text=auto
-*.sh text eol=lf
-Dockerfile text eol=lf
-*.go text eol=lf
+# 统一 LF：这个项目的产物在 Linux 容器里运行，工作区的 CRLF 会直接被
+# docker build 打进镜像（2026-11-06 实测：install-tools.sh 因此执行失败）。
+* text=auto eol=lf
+
+# 二进制不参与换行归一
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.so binary
+*.exe binary
