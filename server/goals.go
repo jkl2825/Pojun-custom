@@ -227,7 +227,14 @@ func (s *Server) admitTaskWhen(t *Task, mode string, requireResumable bool) (que
 		// 上一轮生命周期遗留的挂起收尾请求同样作废——否则复活的第一个规划轮
 		// 会先消费它，把刚复活的任务又收一遍。
 		t.clearSettle()
-		log.Printf("[admission] task %s 从终态 %q 复活，超时预算已重置", t.ID, lifecycle.Status)
+		// 规划轮数与进度行也要归零：resetTerminalRevival 只清时钟与协调器，
+		// 而复活的是「人工跟进」的新一轮工作，沿用上一轮的轮数会让它一开局就
+		// 逼近 auto_finish 的轮数上限，等于换个方式又被收掉。
+		s.engine.plannerRound.Delete(t.ID)
+		if err := s.m.pg.DeleteTaskProgress(t.ID); err != nil {
+			log.Printf("[admission] task %s 复活时清进度失败: %v", t.ID, err)
+		}
+		log.Printf("[admission] task %s 从终态 %q 复活，超时预算与规划轮已重置", t.ID, lifecycle.Status)
 	}
 	if shouldQueue {
 		if !wasQueued {
