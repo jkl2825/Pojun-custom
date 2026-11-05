@@ -272,8 +272,10 @@ var catalog = []Tool{
 	{Name: "interactsh-client", Bin: "interactsh-client", Purpose: "OOB 回连客户端(配合 nuclei 的 oob 模板)", Kind: KindGitHub, Category: CatOOB,
 		Repo: "projectdiscovery/interactsh", AssetTmpl: "interactsh-client_{ver}_linux_{arch}.zip"},
 	// netexec：SMB/Windows 协议横移（CrackMapExec 的现代替代）。
-	// 只在 PyPI 发版，没有 GitHub Release，所以走 pip 配方。
-	{Name: "netexec", Bin: "netexec", Purpose: "SMB/WinRM 横移与凭据喷洒(现代版 CrackMapExec)", Kind: KindPip, Category: CatCred,
+	// 注意（2026-11 实测）：NetExec 商业化后把 PyPI 上的发行文件全部撤下
+	// （/simple/netexec 404），pip 配方必失败——体检会如实显示缺失；
+	// 需要时从 https://github.com/Pennyw0rth/NetExec 源码安装（uv/pipx + git）。
+	{Name: "netexec", Bin: "netexec", Purpose: "SMB/WinRM 横移与凭据喷洒(现代版 CrackMapExec；PyPI 已撤包，需源码安装)", Kind: KindPip, Category: CatCred,
 		Pip: "netexec"},
 	// semgrep：SAST 规则扫描（对下载到的源码做规则匹配）。
 	{Name: "semgrep", Purpose: "源码静态规则扫描(SAST)", Kind: KindPip, Category: CatCode, Pip: "semgrep"},

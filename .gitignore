@@ -2,6 +2,7 @@
 /pojun
 /pojun.exe
 /pojun-*
+!/pojun-update.sh
 /artex
 /artex.exe
 /artex-*

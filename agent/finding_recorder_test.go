@@ -106,3 +106,65 @@ func TestReportFindingAtomicContract(t *testing.T) {
 		t.Fatal("failed tool triggered reporter")
 	}
 }
+
+func TestMechanicalEvidenceFormatDoesNotReplaceRuntimeVerification(t *testing.T) {
+	cases := []struct {
+		name, severity, evidence string
+		reject                   bool
+	}{
+		{"version only", "high", "Server: ExampleServer version 1.0 banner match only", true},
+		{"unsupported claim", "critical", "A serious issue probably exists and needs investigation", true},
+		{"normalised severity", " High ", "A serious issue probably exists", true},
+		{"http format", "high", "HTTP/1.1 200 OK\nContent-Type: application/json\nresponse fixture", false},
+		{"medium keeps policy", "medium", "not yet verified", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if msg := validateMechanicalEvidenceForRun(context.Background(), tc.severity, tc.evidence); (msg != "") != tc.reject {
+				t.Fatalf("message=%q reject=%v", msg, tc.reject)
+			}
+		})
+	}
+	plain := "command observation confirms an unexpected state transition\nindependent local trace confirms the same state transition"
+	if msg := validateMechanicalEvidenceForRun(context.Background(), "high", plain); msg == "" {
+		t.Fatal("unrecorded non-HTTP evidence accepted")
+	}
+	ledger := NewToolOutputLedger()
+	ledger.Add(plain)
+	ctx := WithToolOutputs(context.Background(), ledger, EvidenceVerifyBlock)
+	if msg := validateMechanicalEvidenceForRun(ctx, "high", plain); msg != "" {
+		t.Fatalf("genuine non-HTTP output rejected: %s", msg)
+	}
+	if msg := validateMechanicalEvidenceForRun(ctx, "high", plain+"\nfabricated additional detail that never appeared in tool output"); msg == "" {
+		t.Fatal("partly fabricated text bypassed format gate")
+	}
+	versions := "Server: ExampleServer version 1.0 banner match only\nX-Powered-By: ExampleFramework version 2.0"
+	ledger.Add(versions)
+	if msg := validateMechanicalEvidenceForRun(ctx, "high", versions); msg == "" {
+		t.Fatal("recorded version-only banner became a confirmed vulnerability")
+	}
+}
+
+func TestReportFindingKeywordCannotBypassRealOutputLedger(t *testing.T) {
+	d := testDB(t)
+	defer d.Close()
+	task, err := d.CreateTask("evidence gate", "fixture", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.DeleteTask(task.ID)
+	tools := NewToolSet(d.Exploration(task.ExplorationID), "fixture")
+	tools.SetTaskID(task.ID)
+	ledger := NewToolOutputLedger()
+	ledger.Add("unrelated harmless observation from a local fixture, no request was made")
+	ctx := WithToolOutputs(context.Background(), ledger, EvidenceVerifyBlock)
+	evidenceText := "curl -i http://fixture.invalid/not-called\nHTTP/1.1 200 OK\n" + strings.Repeat("fabricated response data that never appeared in tool output", 4)
+	raw, _ := json.Marshal(map[string]any{"vulnclass": "TEST", "severity": "HIGH", "summary": "fixture must be rejected", "evidence": evidenceText})
+	res, err := tools.addFinding().Call(ctx, raw, nil)
+	if err != nil || !strings.Contains(res.Flatten(), "逐字回验未通过") {
+		t.Fatalf("format keyword bypassed ledger: %v %s", err, res.Flatten())
+	}
+	if tools.writes.Findings != 0 {
+		t.Fatal("rejected finding was counted as persisted")
+	}
+}

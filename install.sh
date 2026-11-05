@@ -118,6 +118,24 @@ if ! command -v curl >/dev/null 2>&1; then
 fi
 command -v curl >/dev/null 2>&1 || die "curl 安装失败，请手动安装"
 
+# CA 证书是后续全部 HTTPS 的前提。极简系统（比如用 --no-install-recommends
+# 装的 curl 不会带入 Recommends 的 ca-certificates）会出现 curl: (77)
+# "error setting certificate file"，所有 HTTPS 请求全挂且报错指不到真因。
+# 两大发行版的 CA 包位置都判一下，缺哪个补哪个；装不上也不阻断（真实新
+# 机器几乎都自带，这里只兜极端裁剪过的系统）。
+if [ ! -e /etc/ssl/certs/ca-certificates.crt ] && [ ! -e /etc/pki/tls/certs/ca-bundle.crt ]; then
+  info "未检测到 CA 证书包，尝试安装 ca-certificates..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq >/dev/null 2>&1 || true
+    apt-get install -y ca-certificates >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y ca-certificates >/dev/null 2>&1 || true
+  fi
+  [ -e /etc/ssl/certs/ca-certificates.crt ] || [ -e /etc/pki/tls/certs/ca-bundle.crt ] \
+    || die "CA 证书包缺失且自动安装失败，请手动安装 ca-certificates 后重试"
+  ok "CA 证书包就绪"
+fi
+
 # ── 出网代理：交互式配置 + 自动验证 ────────────────
 #
 # 为什么交互式：装机最常卡住的就是「这台机器连不上 GitHub / apt 源」。
@@ -875,9 +893,9 @@ install_fonts(){
 # 不用 apt 源：这些工具的 apt 包要么没有要么版本极旧。
 install_github_tools(){
   local GOBIN_DIR="/usr/local/bin"
-  local arch="amd64" arch2="x86_64" arch3="x86" arch4="x64"
+  local arch="amd64" arch2="x86_64" arch3="x86" arch4="x64" lin="x86_64"
   if [ "$ARCH" = "aarch64" ]; then
-    arch="arm64"; arch2="aarch64"; arch3="arm"; arch4="arm64"
+    arch="arm64"; arch2="aarch64"; arch3="arm"; arch4="arm64"; lin="arm64"
   fi
 
   # repo|资产模板|二进制名
@@ -896,6 +914,7 @@ jpillora/chisel|chisel_{ver}_linux_{arch}.gz|chisel
 OWASP/Amass|amass_linux_{arch}.tar.gz|amass
 hahwul/dalfox|dalfox-{verv}-linux-{arch2}.tar.gz|dalfox
 epi052/feroxbuster|{arch2}-linux-feroxbuster.tar.gz|feroxbuster
+OJ/gobuster|gobuster_Linux_{lin}.tar.gz|gobuster
 "
   local spec repo tmpl bin tag ver url asset file tmpd
   for spec in $specs; do
@@ -920,6 +939,7 @@ epi052/feroxbuster|{arch2}-linux-feroxbuster.tar.gz|feroxbuster
     asset="${asset//\{arch2\}/$arch2}"
     asset="${asset//\{arch3\}/$arch3}"
     asset="${asset//\{arch4\}/$arch4}"
+    asset="${asset//\{lin\}/$lin}"
     url="https://github.com/$repo/releases/download/${tag}/${asset}"
     file="$TMP/$(basename "$asset")"
     tmpd="$TMP/ghtool"
@@ -990,9 +1010,10 @@ install_pip_tools(){
   # 包名|可执行文件名(空=该包不提供命令行)。已存在就跳过——
   # pipx 对已装的包会报错退出，不该当成"安装失败"。
   local specs="wafw00f|wafw00f
-netexec|netexec
 semgrep|semgrep
 pwntools|pwntools"
+  # netexec 不装：NetExec 2026 起商业化，PyPI 发行文件已撤下（装必失败）；
+# 需要时从 GitHub 源码安装（hosttools netexec 条目有说明）。
   local spec pkg bin
   for spec in $specs; do
     pkg="$(printf '%s' "$spec" | cut -d'|' -f1)"

@@ -684,6 +684,14 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		t.searchAllWorkerTraces(), t.getWorkerTrace(),
 		// node_detail：worker 拿到 intent_id/节点 id 后可查该节点完整详情（配合上面的回看）。
 		t.nodeDetail(),
+		// expand_digest（v0.4.50）：worker 可以展开冷区折叠的节点完整内容——
+		// 之前 worker 只能看到 title/summary 摘要，折叠内容对 worker 不可见。
+		t.expandDigest(),
+		// list_untested_assets（v0.4.50）：worker 也应该知道哪些资产还没测——
+		// 在执行涉及资产遍历的意图时能自行补漏。
+		t.listUntestedAssets(),
+		// list_goals（v0.4.50）：worker 知道目标完成进度，有助于判断该方向值不值得继续深挖。
+		t.listGoals(),
 		// search_vulns / get_vuln：worker 识别出目标组件与版本后直接查已知漏洞与
 		// 影响区间——公开情报优先于模型现想 payload。
 		t.searchVulns(), t.getVuln(), t.getPoc(), t.scanWithNuclei(), t.netContext(),

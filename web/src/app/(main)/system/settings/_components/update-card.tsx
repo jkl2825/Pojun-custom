@@ -55,6 +55,7 @@ export function UpdateCard() {
         setInfo(r);
         if (!quiet) {
           if (r.error) toast.error(`检查更新失败：${r.error}`);
+          else if (r.self_update_disabled) toast.info("本地定制构建：请通过源码合并更新");
           else if (r.has_update) toast.success(`发现新版本 ${r.latest}`);
           else if (r.comparable) toast.success("当前已是最新版本");
         }
@@ -243,7 +244,16 @@ export function UpdateCard() {
           </p>
         )}
 
-        {info && !info.comparable && info.reason && <p className="text-muted-foreground text-xs">{info.reason}</p>}
+        {info?.self_update_disabled && (
+          <div className="space-y-1 rounded-md border bg-muted/40 p-3 text-xs">
+            <p>{info.reason}</p>
+            <p className="font-mono text-muted-foreground">本地补丁：{info.local_patch}</p>
+            {info.upstream_revision && <p className="break-all font-mono text-muted-foreground">上游基线：{info.upstream_revision}</p>}
+            {info.source_revision && <p className="break-all font-mono text-muted-foreground">源码提交：{info.source_revision}</p>}
+            {info.upstream_has_update && <p>上游有新版本，需审查源码合并，不会自动安装。</p>}
+          </div>
+        )}
+        {info && !info.self_update_disabled && !info.comparable && info.reason && <p className="text-muted-foreground text-xs">{info.reason}</p>}
 
         {info?.has_update && info.asset_available === false && (
           <p className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-2 text-destructive text-xs">
@@ -259,7 +269,7 @@ export function UpdateCard() {
           </p>
         )}
 
-        {info && !info.has_update && info.comparable && !info.error && (
+        {info && !info.self_update_disabled && !info.has_update && info.comparable && !info.error && (
           <p className="flex items-center gap-2 text-muted-foreground text-xs">
             <CheckCircle2Icon className="size-3.5 text-emerald-600" />
             当前已是最新版本。
@@ -292,12 +302,12 @@ export function UpdateCard() {
           <Button
             size="sm"
             onClick={doUpdate}
-            disabled={busy || restarting || !info?.has_update || info?.asset_available === false}
+            disabled={busy || restarting || info?.self_update_disabled || !info?.has_update || info?.asset_available === false}
           >
             <DownloadIcon className="size-4" />
             {info?.has_update ? `更新到 ${info.latest}` : "立即更新"}
           </Button>
-          {info?.has_backup && (
+          {info?.has_backup && !info.self_update_disabled && (
             <Button variant="ghost" size="sm" onClick={doRollback} disabled={busy || restarting}>
               <RotateCcwIcon className="size-4" />
               回滚到上一版本

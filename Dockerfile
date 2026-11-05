@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# 运行镜像（不在镜像里编译）：只装常用工具，放入**预编译好的 Linux 单二进制**。
+# 运行镜像（不在镜像里编译）：装全内置工具，放入**预编译好的 Linux 单二进制**。
 # 二进制由 CI 的 binaries job 交叉编译（纯 Go、无 QEMU），按目标架构放在
 # 构建上下文的 dist/<TARGETARCH>/pojun。这样多架构构建时 arm64 只需模拟 apt 层，
 # 不再模拟 Next/Go 编译，速度快得多。
@@ -10,14 +10,21 @@
 #   cp -r web/out server/webui/dist
 #   CGO_ENABLED=0 GOARCH=amd64 go build -tags embedui -o dist/amd64/pojun ./cmd/pojun
 #   docker build -t pojun:local .
-FROM python:3.12-slim-bookworm
+FROM python:3.11-slim-bookworm
 ARG TARGETARCH
-# 常用工具：ripgrep / curl / vim，加一批 recon 常备件（按需增删）。
+# 基础件 + 渗透工具组。渗透组逐包容错：Debian bookworm 源没有的包（如 nikto，
+# Kali 源才有）跳过不阻断构建，运行期「宿主环境」体检页会如实显示缺失；
+# gobuster/gitleaks 等更新更全的版本走 docker/install-tools.sh 的 GitHub release。
 # Node 从 NodeSource 装 20.x：bookworm 自带的 apt nodejs 是 18，Playwright 要求 >=20。
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates ripgrep curl wget vim git jq unzip \
-      dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
-      imagemagick libreoffice-writer libreoffice-calc libreoffice-impress poppler-utils \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         ca-certificates ripgrep curl wget vim git jq unzip \
+         dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
+         imagemagick libreoffice-writer libreoffice-calc libreoffice-impress poppler-utils \
+    && for pkg in masscan sqlmap hydra whatweb nikto ffuf john python3-impacket socat proxychains4; do \
+         apt-get install -y --no-install-recommends "$pkg" >/dev/null 2>&1 \
+         || echo "[warn] apt 包不可用，跳过: $pkg"; \
+       done \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -31,8 +38,14 @@ RUN set -eux; \
       arm64) nuclei_arch="linux_arm64" ;; \
       *) echo "unsupported arch: $arch"; exit 1 ;; \
     esac; \
-    nuclei_ver="$(curl -fsSL https://api.github.com/repos/projectdiscovery/nuclei/releases/latest | jq -r .tag_name)"; \
-    curl -fsSL "https://github.com/projectdiscovery/nuclei/releases/download/${nuclei_ver}/nuclei_${nuclei_ver#v}_${nuclei_arch}.zip" -o /tmp/nuclei.zip; \
+    # 版本解析双通道：GitHub API 对 CI runner 共享 IP 经常 403 限流（实测
+    # 2026-11-05 v0.4.54 构建挂在这），后备走 releases/latest 的 302 Location
+    # ——浏览器同款路径，不吃 API 配额。api github 域名也要加超时防挂死。
+    nuclei_ver="$(curl -fsSL --retry 3 --connect-timeout 15 --max-time 60 https://api.github.com/repos/projectdiscovery/nuclei/releases/latest | jq -r .tag_name)" || nuclei_ver=""; \
+    [ -n "$nuclei_ver" ] && [ "$nuclei_ver" != "null" ] || \
+      nuclei_ver="$(curl -fsSL --retry 3 --connect-timeout 15 --max-time 60 -o /dev/null -w '%{url_effective}' https://github.com/projectdiscovery/nuclei/releases/latest | sed 's|.*/tag/||')"; \
+    [ -n "$nuclei_ver" ] || { echo "cannot resolve nuclei version"; exit 1; }; \
+    curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 "https://github.com/projectdiscovery/nuclei/releases/download/${nuclei_ver}/nuclei_${nuclei_ver#v}_${nuclei_arch}.zip" -o /tmp/nuclei.zip; \
     unzip -o /tmp/nuclei.zip -d /tmp/nuclei && install -m 0755 /tmp/nuclei/nuclei /usr/local/bin/nuclei \
     && nuclei -version && rm -rf /tmp/nuclei /tmp/nuclei.zip
 # 预装 Playwright MCP 与 CLI（全局），运行时不再 npx 联网下载。
@@ -53,6 +66,14 @@ COPY dist/${TARGETARCH}/pojun /app/pojun
 COPY start.sh /app/start.sh
 RUN chmod +x /app/pojun /app/start.sh
 COPY skills/ /app/skills/
+# 公文字体：docx→PDF 渲染需要（install.sh 二进制形态从 raw 下载；镜像直接 COPY 仓库内文件）
+COPY report/fonts/ /usr/share/fonts/gongwen/
+RUN fc-cache -f /usr/share/fonts/gongwen >/dev/null 2>&1 || true
+# 内置渗透工具与字典（对齐 install.sh --with-tools；详见 docker/install-tools.sh）：
+# projectdiscovery 全家桶 / gobuster / gitleaks / chisel / amass / dalfox /
+# feroxbuster + pip 组（wafw00f/netexec/semgrep/pwntools）+ SecLists → /opt/SecLists
+COPY docker/install-tools.sh /tmp/install-tools.sh
+RUN bash /tmp/install-tools.sh && rm -f /tmp/install-tools.sh
 # data/（SQLite + jwt.key）持久化点
 VOLUME ["/app/data"]
 EXPOSE 8787 8788

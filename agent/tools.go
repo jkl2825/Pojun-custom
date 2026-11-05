@@ -1725,6 +1725,12 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if msg := validateFindingEvidence(a.Severity, a.Evidence); msg != "" {
 			return actool.Errorf(msg), nil
 		}
+		// 机械验证凭据校验（v0.4.52）：critical/high 必须附 HTTP 状态码/curl 输出/
+		// 工具命中结果等可机械复现的验证凭据。纯版本匹配不通过。
+		a.Severity = strings.ToLower(strings.TrimSpace(a.Severity))
+		if msg := validateMechanicalEvidenceForRun(ctx, a.Severity, a.Evidence); msg != "" {
+			return actool.Errorf(msg), nil
+		}
 		// 证据逐字回验（v0.4.29，P0b #2，PentestGPT 机制自研）：先告警后拦截。
 		// 证据里至少要有一行能在本次 run 的真实工具回显里逐字找到出处——
 		// 「none」且档位=block 时只打回 critical/high（误报代价最高的两档）。

@@ -1,7 +1,8 @@
 name: release
 on:
+  workflow_dispatch:
   push:
-    tags: ["v*"]
+    tags: ["custom/v*"]
 
 permissions:
   contents: write # 创建 Release 需要
@@ -51,7 +52,10 @@ jobs:
         env:
           POJUN_TARGET_OS: ${{ matrix.goos }}
           POJUN_TARGET_ARCH: ${{ matrix.goarch }}
-          POJUN_BUILD_VERSION: ${{ github.ref_name }}
+          POJUN_BUILD_VERSION: ${{ startsWith(github.ref, 'refs/tags/custom/') && github.ref_name || format('0.4.54-custom-{0}', github.run_number) }}
+          POJUN_LOCAL_PATCH: downstream-custom
+          POJUN_SOURCE_REVISION: ${{ github.sha }}
+          POJUN_UPSTREAM_REVISION: 234dd89a52eebc0dc84fce121e5456f2748fcaa3
           POJUN_SKIP_FRONTEND: "1"
           POJUN_SKIP_NPM_CI: "1"
           # UPX 自解压 ELF 在部分 Linux 内核、虚拟化和安全策略下会崩溃。
@@ -157,7 +161,7 @@ jobs:
           DOCKERHUB_OK: ${{ needs.docker-cred-check.outputs.ok }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
-          imgs="ghcr.io/chu0119/pojun"
+          imgs="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
           if [ "$DOCKERHUB_OK" = "true" ] && [ -n "$DOCKERHUB_USERNAME" ]; then
             imgs="$imgs,${DOCKERHUB_USERNAME}/pojun"
           fi

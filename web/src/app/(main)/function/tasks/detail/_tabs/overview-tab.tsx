@@ -28,8 +28,8 @@ import {
 import { StatusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { ArtifactDataViewerDialog } from "@/components/artifact-data-viewer";
+import { ZoomableImageDialog } from "@/components/zoomable-image-dialog";
 import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Progress } from "@/components/ui/progress";
@@ -1803,94 +1803,62 @@ function TaskArtifactsCard({ taskId }: { taskId: string }) {
           </CardContent>
         )}
       </Card>
-      <Dialog
+      {/* v0.4.53：图片预览接入 ZoomableImageDialog（滚轮缩放/拖拽平移），替代静态 img——
+          此前 v0.4.48 只替换了漏洞详情页，任务总览漏掉，大图（2250x1500 曲线图等）看不清细节。 */}
+      <ZoomableImageDialog
         open={!!preview}
-        onOpenChange={(o) => {
-          if (!o) setPreview(null);
-        }}
-      >
-        <DialogContent className="max-w-5xl">
-          <DialogHeader>
-            <DialogTitle className="break-all text-base">{preview?.note || preview?.name}</DialogTitle>
-          </DialogHeader>
-          {preview && (
-            <>
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src={fullUrl(preview.id)}
-                alt={preview.note || preview.name}
-                className="mx-auto max-h-[68vh] w-auto max-w-full rounded object-contain"
-              />
-              <div className="flex flex-wrap items-center justify-between gap-2 text-muted-foreground text-xs">
-                <span className="break-all">
-                  {preview.name} · {fmtSize(preview.size_bytes)}
-                  {preview.finding_id ? ` · 漏洞 #${preview.finding_id}` : ""}
-                </span>
-                <Button size="sm" variant="outline" asChild>
-                  <a href={downloadUrl(preview.id)}>下载原件</a>
-                </Button>
-              </div>
-            </>
-          )}
-        </DialogContent>
-      </Dialog>
+        onClose={() => setPreview(null)}
+        src={preview ? fullUrl(preview.id) : ""}
+        title={preview?.note || preview?.name || ""}
+        description={
+          preview
+            ? `${preview.name} · ${fmtSize(preview.size_bytes)}${preview.finding_id ? ` · 漏洞 #${preview.finding_id}` : ""}`
+            : ""
+        }
+        downloadUrl={preview ? downloadUrl(preview.id) : ""}
+      />
       <ArtifactDataViewerDialog
         taskId={taskId}
         artifact={dataPreview}
         open={!!dataPreview}
         onClose={() => setDataPreview(null)}
       />
-      <Dialog
+      {/* v0.4.53：文档分页预览同样接入缩放组件——Word/PDF 转图后每页是一张静态图，
+          报告细节（表格/签名/小字）不缩放看不清。翻页时 src 变化自动重置缩放。 */}
+      <ZoomableImageDialog
         open={!!docPreview}
-        onOpenChange={(o) => {
-          if (!o) setDocPreview(null);
-        }}
-      >
-        <DialogContent className="max-w-6xl">
-          <DialogHeader>
-            <DialogTitle className="break-all text-base">
-              {docPreview?.artifact.note || docPreview?.artifact.name}
-            </DialogTitle>
-          </DialogHeader>
-          {docPreview && (
-            <>
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src={previewUrl(docPreview.artifact.id, docPreview.page)}
-                alt={`${docPreview.artifact.name} 第 ${docPreview.page} 页`}
-                className="mx-auto max-h-[70vh] w-auto max-w-full rounded border object-contain"
-              />
-              <div className="flex flex-wrap items-center justify-between gap-2 text-muted-foreground text-xs">
-                <span className="break-all">
-                  {docPreview.artifact.name} · 第 {docPreview.page} / {docPreview.artifact.preview_pages ?? 0} 页
-                  {docPreview.artifact.finding_id ? ` · 漏洞 #${docPreview.artifact.finding_id}` : ""}
-                </span>
-                <div className="flex items-center gap-2">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={docPreview.page <= 1}
-                    onClick={() => setDocPreview((cur) => (cur ? { ...cur, page: cur.page - 1 } : cur))}
-                  >
-                    <ChevronLeftIcon className="size-3.5" /> 上一页
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={docPreview.page >= (docPreview.artifact.preview_pages ?? 1)}
-                    onClick={() => setDocPreview((cur) => (cur ? { ...cur, page: cur.page + 1 } : cur))}
-                  >
-                    下一页 <ChevronRightIcon className="size-3.5" />
-                  </Button>
-                  <Button size="sm" variant="outline" asChild>
-                    <a href={downloadUrl(docPreview.artifact.id)}>下载原件</a>
-                  </Button>
-                </div>
-              </div>
-            </>
-          )}
-        </DialogContent>
-      </Dialog>
+        onClose={() => setDocPreview(null)}
+        src={docPreview ? previewUrl(docPreview.artifact.id, docPreview.page) : ""}
+        title={docPreview?.artifact.note || docPreview?.artifact.name || ""}
+        description={
+          docPreview
+            ? `${docPreview.artifact.name} · 第 ${docPreview.page} / ${docPreview.artifact.preview_pages ?? 0} 页${docPreview.artifact.finding_id ? ` · 漏洞 #${docPreview.artifact.finding_id}` : ""}`
+            : ""
+        }
+        downloadUrl={docPreview ? downloadUrl(docPreview.artifact.id) : ""}
+        footer={
+          docPreview ? (
+            <div className="flex items-center justify-center gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={docPreview.page <= 1}
+                onClick={() => setDocPreview((cur) => (cur ? { ...cur, page: cur.page - 1 } : cur))}
+              >
+                <ChevronLeftIcon className="size-3.5" /> 上一页
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={docPreview.page >= (docPreview.artifact.preview_pages ?? 1)}
+                onClick={() => setDocPreview((cur) => (cur ? { ...cur, page: cur.page + 1 } : cur))}
+              >
+                下一页 <ChevronRightIcon className="size-3.5" />
+              </Button>
+            </div>
+          ) : null
+        }
+      />
     </>
   );
 }

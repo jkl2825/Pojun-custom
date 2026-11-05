@@ -474,3 +474,278 @@ func TestFindingTrafficUTF8SegmentsAndInheritedWrites(t *testing.T) {
 		}
 	}
 }
+
+func TestZipDocxFilesContents(t *testing.T) {
+	stage := t.TempDir()
+	contents := map[string]string{"b.docx": "第二份文档", "a.DOCX": "第一份文档", "ignored.txt": "不应打包"}
+	for name, content := range contents {
+		if err := os.WriteFile(filepath.Join(stage, name), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(stage, "nested.docx"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(stage, "findings.zip")
+	if err := zipDocxFiles(stage, path); err != nil {
+		t.Fatal(err)
+	}
+	archive, err := zip.OpenReader(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.Close()
+	if len(archive.File) != 2 {
+		t.Fatalf("应仅包含两份 DOCX，实际为 %d", len(archive.File))
+	}
+	for i, name := range []string{"a.DOCX", "b.docx"} {
+		entry := archive.File[i]
+		if entry.Name != name {
+			t.Fatalf("文档顺序错误：%q，应为 %q", entry.Name, name)
+		}
+		r, err := entry.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(r)
+		closeErr := r.Close()
+		if err != nil || closeErr != nil {
+			t.Fatal(err, closeErr)
+		}
+		if string(data) != contents[name] {
+			t.Fatalf("文档内容发生变化：%q", name)
+		}
+	}
+}
+
+func TestZipDocxFilesEmpty(t *testing.T) {
+	stage := t.TempDir()
+	if err := os.WriteFile(filepath.Join(stage, "ignored.txt"), []byte("不应打包"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(stage, "empty.zip")
+	if err := zipDocxFiles(stage, path); err != nil {
+		t.Fatal(err)
+	}
+	archive, err := zip.OpenReader(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.Close()
+	if len(archive.File) != 0 {
+		t.Fatal("无 DOCX 时应生成有效空 ZIP")
+	}
+}
+
+func TestZipDocxFilesErrors(t *testing.T) {
+	t.Run("missing-stage", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := zipDocxFiles(filepath.Join(dir, "missing"), filepath.Join(dir, "out.zip")); err == nil {
+			t.Fatal("目录不存在时必须返回错误")
+		}
+	})
+	t.Run("stage-is-file", func(t *testing.T) {
+		dir := t.TempDir()
+		stage := filepath.Join(dir, "file")
+		if err := os.WriteFile(stage, []byte("非目录"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := zipDocxFiles(stage, filepath.Join(dir, "out.zip")); err == nil {
+			t.Fatal("源路径不是目录时必须返回错误")
+		}
+	})
+	t.Run("output-is-directory", func(t *testing.T) {
+		if err := zipDocxFiles(t.TempDir(), t.TempDir()); err == nil {
+			t.Fatal("ZIP 输出路径是目录时必须返回错误")
+		}
+	})
+	t.Run("unreadable-stage", func(t *testing.T) {
+		stage := t.TempDir()
+		if err := os.Chmod(stage, 0000); err != nil {
+			t.Skipf("无法设置目录权限：%v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(stage, 0700) })
+		if _, err := os.ReadDir(stage); err == nil {
+			t.Skip("当前用户或平台不限制目录读取权限")
+		}
+		if err := zipDocxFiles(stage, filepath.Join(t.TempDir(), "out.zip")); err == nil {
+			t.Fatal("目录不可读时必须返回错误")
+		}
+	})
+	t.Run("unreadable-docx", func(t *testing.T) {
+		stage := t.TempDir()
+		if err := os.Symlink(filepath.Join(stage, "missing"), filepath.Join(stage, "broken.docx")); err != nil {
+			t.Skipf("无法创建失效文档链接：%v", err)
+		}
+		if err := zipDocxFiles(stage, filepath.Join(t.TempDir(), "out.zip")); err == nil {
+			t.Fatal("文档读取失败时不得静默漏掉文档")
+		}
+	})
+}
+
+func TestWorkerReadOnlyToolsV054UpgradePreservesCustomization(t *testing.T) {
+	dsn, _, err := db.DSN()
+	if err != nil || !db.IsTestDatabase(dsn) {
+		t.Skip("worker 工具迁移回归需要 _test 隔离测试库")
+	}
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { m.Close() })
+	pg := m.pg
+	const flag = "worker_read_only_tools_v054"
+	oldFlag, hadFlag, err := pg.GetSetting(flag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if hadFlag {
+			_ = pg.SetSetting(flag, oldFlag)
+		} else {
+			_, _ = pg.Exec(`DELETE FROM settings WHERE key=$1`, flag)
+		}
+	})
+	keys := []string{"expand_digest", "list_untested_assets", "list_goals"}
+	custom := json.RawMessage(`{"type":"object","properties":{"note":{"type":"string","description":"用户参数说明","default":"保留默认值"}}}`)
+	before := make(map[string]*db.Tool, len(keys))
+	for _, key := range keys {
+		old, err := pg.GetTool(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if old == nil {
+				_, _ = pg.Exec(`DELETE FROM tools WHERE key=$1`, key)
+			} else {
+				bindings, _ := json.Marshal(old.Agents)
+				_ = pg.UpdateTool(old.Key, old.Description, old.Schema, bindings, old.Enabled)
+			}
+		})
+		if err := pg.SeedTool(key, "用户工具说明", custom, json.RawMessage(`["planner","custom_agent"]`)); err != nil {
+			t.Fatal(err)
+		}
+		if err := pg.UpdateTool(key, "用户工具说明", custom, json.RawMessage(`["planner","custom_agent"]`), false); err != nil {
+			t.Fatal(err)
+		}
+		before[key], err = pg.GetTool(key)
+		if err != nil || before[key] == nil {
+			t.Fatalf("无法读取迁移前工具 %s：%v", key, err)
+		}
+	}
+	if err := pg.SetSetting(flag, "false"); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedWorkerReadOnlyToolsV054(pg); err != nil {
+		t.Fatal(err)
+	}
+	if value, _, err := pg.GetSetting(flag); err != nil || value != "true" {
+		t.Fatalf("迁移成功后未记录完成状态：%q，%v", value, err)
+	}
+	for _, key := range keys {
+		tool, err := pg.GetTool(key)
+		if err != nil || tool == nil {
+			t.Fatalf("无法读取迁移后工具 %s：%v", key, err)
+		}
+		original := before[key]
+		if tool.Enabled || tool.Description != original.Description || !bytes.Equal(tool.Schema, original.Schema) || len(tool.Agents) != 3 || tool.Agents[0] != "planner" || tool.Agents[1] != "custom_agent" || tool.Agents[2] != "worker" {
+			t.Fatalf("迁移覆盖了工具 %s 的用户配置：%+v", key, tool)
+		}
+		if err := pg.RemoveAgentFromTool("worker", key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := seedWorkerReadOnlyToolsV054(pg); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range keys {
+		tool, err := pg.GetTool(key)
+		if err != nil || tool == nil {
+			t.Fatalf("无法读取再次启动后的工具 %s：%v", key, err)
+		}
+		if contains(tool.Agents, "worker") || len(tool.Agents) != 2 || tool.Enabled || tool.Description != before[key].Description || !bytes.Equal(tool.Schema, before[key].Schema) {
+			t.Fatalf("第二次执行恢复了用户移除的绑定或覆盖配置：%+v", tool)
+		}
+	}
+}
+
+func TestDispatchSchemaUpgradeOnlyAddsMissingOptionalFields(t *testing.T) {
+	dsn, _, err := db.DSN()
+	if err != nil || !db.IsTestDatabase(dsn) {
+		t.Skip("requires _test database")
+	}
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	pg := m.pg
+	key := "add_intent"
+	before, err := pg.GetTool(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before == nil {
+		for _, seed := range agent.BuiltinToolSeeds() {
+			if seed.Key != key {
+				continue
+			}
+			raw, _ := json.Marshal(seed.Schema)
+			bindings, _ := json.Marshal(seed.Agents)
+			if err := pg.SeedTool(key, seed.Desc, raw, bindings); err != nil {
+				t.Fatal(err)
+			}
+		}
+		before, err = pg.GetTool(key)
+		if err != nil || before == nil {
+			t.Fatalf("missing tool fixture: %v", err)
+		}
+	}
+	const flag = "downstream_dispatch_schema_v1"
+	oldFlag, hadFlag, _ := pg.GetSetting(flag)
+	t.Cleanup(func() {
+		bindings, _ := json.Marshal(before.Agents)
+		_ = pg.UpdateTool(key, before.Description, before.Schema, bindings, before.Enabled)
+		if hadFlag {
+			_ = pg.SetSetting(flag, oldFlag)
+		} else {
+			_, _ = pg.Exec(`DELETE FROM settings WHERE key=$1`, flag)
+		}
+	})
+	custom := json.RawMessage(`{"type":"object","properties":{"summary":{"type":"string","description":"keep user text"},"collaboration_angle":{"type":"string","default":"user angle"}},"required":["summary"]}`)
+	if err := pg.UpdateTool(key, "user description", custom, json.RawMessage(`["planner"]`), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := pg.SetSetting(flag, "false"); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedDispatchSchemaV1(pg); err != nil {
+		t.Fatal(err)
+	}
+	tool, err := pg.GetTool(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
+	}
+	if err := json.Unmarshal(tool.Schema, &schema); err != nil {
+		t.Fatal(err)
+	}
+	if tool.Enabled || tool.Description != "user description" || len(tool.Agents) != 1 || tool.Agents[0] != "planner" || len(schema.Required) != 1 || schema.Required[0] != "summary" || !bytes.Contains(schema.Properties["summary"], []byte("keep user text")) || !bytes.Contains(schema.Properties["collaboration_angle"], []byte("user angle")) {
+		t.Fatalf("customization replaced: %+v", tool)
+	}
+	for _, field := range []string{"collaborates_with", "collaboration_angle", "briefing_ids"} {
+		if len(schema.Properties[field]) == 0 {
+			t.Fatalf("missing %s", field)
+		}
+	}
+	if err := seedDispatchSchemaV1(pg); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := pg.GetTool(key)
+	if !bytes.Equal(after.Schema, tool.Schema) {
+		t.Fatal("second migration changed schema")
+	}
+}

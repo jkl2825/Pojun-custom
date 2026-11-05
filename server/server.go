@@ -1,6 +1,7 @@
 package server
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -830,8 +831,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/tasks/{id}/auth-check", s.taskAuthCheck) // 登录凭据自检（真实发一次登录请求）
 	// 证据附件（v0.5.0）：列表 / 单文件下载 / 证据包 zip。
 	mux.HandleFunc("GET /api/tasks/{id}/artifacts", s.listTaskArtifacts)
-	mux.HandleFunc("PATCH /api/tasks/{id}/artifacts/{aid}", s.patchTaskArtifact) // 改归属（任务级 ↔ 漏洞）
-	mux.HandleFunc("POST /api/tasks/{id}/artifacts/scan", s.scanTaskArtifacts)     // 历史目录补登记
+	mux.HandleFunc("PATCH /api/tasks/{id}/artifacts/{aid}", s.patchTaskArtifact)    // 改归属（任务级 ↔ 漏洞）
+	mux.HandleFunc("POST /api/tasks/{id}/artifacts/scan", s.scanTaskArtifacts)      // 历史目录补登记
 	mux.HandleFunc("POST /api/tasks/{id}/artifacts/auto-bind", s.autoBindArtifacts) // 智能关联（v0.4.42）
 	mux.HandleFunc("GET /api/tasks/{id}/artifacts/export", s.exportTaskArtifacts)
 	mux.HandleFunc("GET /api/tasks/{id}/artifacts/{aid}", s.serveTaskArtifact)
@@ -1036,7 +1037,9 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 
 // version 是鉴权的版本查询（更新卡轮询换装完成用）。
 func (s *Server) version(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"service": "pojun", "version": BuildVersion})
+	writeJSON(w, 200, map[string]any{"service": "pojun", "version": BuildVersion,
+		"local_patch": LocalPatchVersion, "upstream_revision": UpstreamRevision,
+		"source_revision": SourceRevision, "self_update_disabled": LocalPatchVersion != ""})
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
@@ -2326,6 +2329,59 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 		defer file.Close()
 		setDownload("application/zip", "findings-"+stamp+".zip")
 		http.ServeContent(w, r, "findings.zip", now, file)
+	case "docx-zip":
+		// 批量 Word 导出（v0.4.48）：每条漏洞生成独立 .docx 并打包 zip。
+		for _, f := range fs {
+			fCopy := *f
+			names := s.reportAssetNames([]*db.DBFinding{&fCopy})
+			retests, _ := s.m.pg.ListFindingRetests(fCopy.ID)
+			customer := ""
+			classification := "内部资料 · 仅限授权方"
+			if fCopy.TaskID != nil && *fCopy.TaskID > 0 {
+				if tt := s.m.ResolveTask(strconv.FormatInt(*fCopy.TaskID, 10)); tt != nil {
+					customer = s.taskCustomerNames(tt)
+				}
+			}
+			doc := report.BuildFindingDocx(report.FindingDocxInput{
+				Finding:        &fCopy,
+				GeneratedAt:    now,
+				AssetNameMap:   names,
+				Retests:        retests,
+				Customer:       customer,
+				Classification: classification,
+				ArtifactImage: func() func(int64) ([]byte, string, bool) {
+					if fCopy.TaskID == nil || *fCopy.TaskID <= 0 {
+						return nil
+					}
+					return s.artifactImageResolver(strconv.FormatInt(*fCopy.TaskID, 10), fCopy.ID)
+				}(),
+			})
+			fname := fmt.Sprintf("pojun-finding-%d-%s.docx", fCopy.ID, now.Format("20060102"))
+			docFile := filepath.Join(stage, fname)
+			file, err := os.Create(docFile)
+			if err != nil {
+				writeErr(w, 500, err.Error())
+				return
+			}
+			err = errors.Join(doc.Encode(file), file.Close())
+			if err != nil {
+				writeErr(w, 500, err.Error())
+				return
+			}
+		}
+		zipPath := filepath.Join(stage, "findings-word-"+stamp+".zip")
+		if err := zipDocxFiles(stage, zipPath); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		file, err := os.Open(zipPath)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		defer file.Close()
+		setDownload("application/zip", "findings-word-"+stamp+".zip")
+		http.ServeContent(w, r, "findings-word-"+stamp+".zip", now, file)
 	case "csv":
 		setDownload("text/csv; charset=utf-8", "findings-"+stamp+".csv")
 		_, _ = w.Write(report.FindingsCSV(fs))
@@ -3476,7 +3532,7 @@ func (s *Server) settingsPayload() map[string]any {
 		"intent_budget_enabled": ib.Enabled,
 		"intent_budget_tokens":  ib.Tokens,
 		// 证据逐字回验（v0.4.29）：off|warn|block，默认 warn。
-		"finding_evidence_verify":    evidenceVerifyModeFromPG(s.m.pg).String(),
+		"finding_evidence_verify":     evidenceVerifyModeFromPG(s.m.pg).String(),
 		"tool_output_injection_guard": injectionGuardFromPG(s.m.pg),
 		// LLM 轮询(故障转移)。默认关；开启后走全局激活配置的 agent 在当前配置不可用时
 		// 自动切到下一个配置。bind_fallback 仅在轮询开启时有意义(默认关)。
@@ -3574,8 +3630,8 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		IntentBudgetEnabled *bool `json:"intent_budget_enabled"`
 		IntentBudgetTokens  *int  `json:"intent_budget_tokens"`
 		// 证据逐字回验（v0.4.29）：off|warn|block；工具输出注入告警开关。
-		EvidenceVerify     *string `json:"finding_evidence_verify"`
-		InjectionGuard     *bool   `json:"tool_output_injection_guard"`
+		EvidenceVerify *string `json:"finding_evidence_verify"`
+		InjectionGuard *bool   `json:"tool_output_injection_guard"`
 		// LLM 轮询(故障转移)开关 + 「绑定配置失败也兜底回轮询链」开关。两者都需要
 		// 重建 provider 链才生效，走下面的 changed → applyLLM 路径。
 		LLMPoolEnabled      *bool `json:"llm_pool_enabled"`
@@ -4248,4 +4304,40 @@ func atoiDefault(s string, d int) int {
 		return n
 	}
 	return d
+}
+
+// zipDocxFiles 打包 stage 目录下的 .docx 文件为 zip（v0.4.48 批量 Word 导出）。
+func zipDocxFiles(stage, zipPath string) (err error) {
+	entries, err := os.ReadDir(stage)
+	if err != nil {
+		return err
+	}
+	zipFile, err := os.Create(zipPath)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, zipFile.Close()) }()
+	zw := zip.NewWriter(zipFile)
+	defer func() { err = errors.Join(err, zw.Close()) }()
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".docx") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(stage, e.Name()))
+		if err != nil {
+			return err
+		}
+		f, err := zw.Create(e.Name())
+		if err != nil {
+			return err
+		}
+		n, err := f.Write(data)
+		if err != nil {
+			return err
+		}
+		if n != len(data) {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }

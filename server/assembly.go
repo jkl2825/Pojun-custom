@@ -257,6 +257,12 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 			log.Printf("[tools] seed %s 失败: %v", s.Key, err)
 		}
 	}
+	if err := seedWorkerReadOnlyToolsV054(pg); err != nil {
+		log.Printf("[tools] worker 只读工具绑定迁移失败: %v", err)
+	}
+	if err := seedDispatchSchemaV1(pg); err != nil {
+		log.Printf("[tools] 协作可选参数迁移失败: %v", err)
+	}
 	// Seed the traffic host tools so they're bindable per-agent like built-ins.
 	// Default binding = worker (preserves prior behavior). Their runtime availability
 	// is still gated by the global capture switch (hostTools() returns them only when
@@ -378,6 +384,99 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 		}
 		return out
 	}
+}
+
+// 仅迁移新增的只读绑定；成功后不再恢复用户主动移除的 worker 绑定。
+func seedWorkerReadOnlyToolsV054(pg *db.DB) error {
+	const flag = "worker_read_only_tools_v054"
+	value, _, err := pg.GetSetting(flag)
+	if err != nil {
+		return err
+	}
+	if value == "true" {
+		return nil
+	}
+	keys := []string{"expand_digest", "list_untested_assets", "list_goals"}
+	for _, key := range keys {
+		tool, err := pg.GetTool(key)
+		if err != nil {
+			return err
+		}
+		if tool == nil || !tool.System || tool.Kind != "builtin" {
+			return fmt.Errorf("只读工具 %s 不是已登记的系统内置工具", key)
+		}
+	}
+	if err := pg.AddAgentToToolBinding("worker", keys); err != nil {
+		return err
+	}
+	return pg.SetSetting(flag, "true")
+}
+
+// Add only optional code-defined fields. Never replace a user's descriptions,
+// defaults, required set, bindings or enabled flag on an already-seeded tool.
+func seedDispatchSchemaV1(pg *db.DB) error {
+	const flag = "downstream_dispatch_schema_v1"
+	if value, _, err := pg.GetSetting(flag); err != nil {
+		return err
+	} else if value == "true" {
+		return nil
+	}
+	var properties map[string]json.RawMessage
+	for _, seed := range agent.BuiltinToolSeeds() {
+		if seed.Key != "add_intent" {
+			continue
+		}
+		raw, err := json.Marshal(seed.Schema)
+		if err != nil {
+			return err
+		}
+		var schema struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			return err
+		}
+		properties = schema.Properties
+	}
+	keys := []string{"collaborates_with", "collaboration_angle", "briefing_ids"}
+	for _, key := range keys {
+		if len(properties[key]) == 0 {
+			return fmt.Errorf("missing dispatch property %s", key)
+		}
+	}
+	tx, err := pg.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var raw []byte
+	if err := tx.QueryRow(`SELECT schema FROM tools WHERE key='add_intent' AND system AND kind='builtin' FOR UPDATE`).Scan(&raw); err != nil {
+		return err
+	}
+	var stored map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		return err
+	}
+	if len(stored["properties"]) == 0 || string(stored["properties"]) == "null" {
+		if _, err := tx.Exec(`UPDATE tools SET schema=jsonb_set(schema,'{properties}','{}'::jsonb,true) WHERE key='add_intent' AND system`); err != nil {
+			return err
+		}
+	} else {
+		var existing map[string]json.RawMessage
+		if err := json.Unmarshal(stored["properties"], &existing); err != nil {
+			return err
+		}
+	}
+	for _, key := range keys {
+		if _, err := tx.Exec(`UPDATE tools SET schema=jsonb_set(schema,ARRAY['properties',$1::text],$2::jsonb,true),updated_at=now()
+		WHERE key='add_intent' AND system AND NOT(COALESCE(schema->'properties','{}'::jsonb) ? $1)`, key, string(properties[key])); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO settings(key,value) VALUES($1,'true') ON CONFLICT(key) DO UPDATE SET value='true',updated_at=now()`, flag); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func contains(ss []string, v string) bool {

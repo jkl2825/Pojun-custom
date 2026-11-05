@@ -1,11 +1,12 @@
-# 本地薄层镜像：在上游 pojun 镜像之上只补装 impacket。
-# 上游更新频繁，用这层把"额外依赖"和上游镜像解耦：
-#   上游出新版 -> 只需 pull 基础镜像 + 重建本层(秒级) -> impacket 永远在。
-# 用法见 pojun-update.sh。基础镜像由 BASE 参数传入，默认 Docker Hub 源。
-ARG BASE=xingchuan1314/pojun:latest
+# Downstream application layer. Build and test source with build.sh first.
+# Keep the verified tool/browser/CA base; never replace it with upstream latest.
+ARG BASE=pojun-local/pojun:0.4.47-sapper-collab-20261105
 FROM ${BASE}
-# impacket：psexec.py / secretsdump.py / smbclient.py / wmiexec.py /
-# GetNPUsers.py / GetUserSPNs.py 等横向移动与凭据抓取入口。
-RUN pip3 install --no-cache-dir --break-system-packages impacket \
-    && psexec.py -h >/dev/null 2>&1 \
-    && echo "impacket OK"
+ARG SOURCE_REVISION
+ARG UPSTREAM_REVISION=234dd89a52eebc0dc84fce121e5456f2748fcaa3
+ARG LOCAL_PATCH=downstream-20261105
+COPY --chmod=0755 dist/amd64/pojun /app/pojun
+LABEL org.opencontainers.image.source="https://github.com/jkl2825/Pojun-custom" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      local.pojun.upstream="${UPSTREAM_REVISION}" \
+      local.pojun.patch="${LOCAL_PATCH}"

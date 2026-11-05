@@ -72,12 +72,15 @@ func FindingsMarkdown(fs []*db.DBFinding, generatedAt time.Time) string {
 		if desc := strings.TrimSpace(f.TaskDescription); desc != "" {
 			fmt.Fprintf(&b, "- **所属任务**：%s\n", desc)
 		}
-		fmt.Fprintf(&b, "- **发现时间**：%s\n\n", f.CreatedAt.Format("2006-01-02 15:04:05"))
+		fmt.Fprintf(&b, "- **发现时间**：%s\n", f.CreatedAt.Format("2006-01-02 15:04:05"))
+		if w := strings.TrimSpace(f.Worker); w != "" {
+			fmt.Fprintf(&b, "- **发现者**：%s\n", w)
+		}
 		if s := strings.TrimSpace(f.Summary); s != "" {
 			fmt.Fprintf(&b, "%s\n\n", s)
 		}
 		if e := strings.TrimSpace(f.Evidence); e != "" {
-			fmt.Fprintf(&b, "**证据：**\n\n```\n%s\n```\n\n", e)
+			fmt.Fprintf(&b, "**证据 / PoC：**\n\n```\n%s\n```\n\n", e)
 		}
 		if rep := strings.TrimSpace(f.Report); rep != "" {
 			b.WriteString("**详细报告：**\n\n")

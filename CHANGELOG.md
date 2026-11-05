@@ -4,6 +4,135 @@
 
 ## [Unreleased]
 
+## [0.4.54] - 2026-11-05
+
+> Docker 镜像内置工具补齐：此前镜像只有 recon 基础件（nmap/nuclei/
+> Playwright/LibreOffice），与二进制形态 --with-tools 的工具集差一大截，
+> 而 Docker 形态没有 pojun-hostd 一键安装——缺的工具永远显示缺失。
+
+### 新增
+
+- **镜像内置工具对齐 --with-tools**：apt 组（masscan/sqlmap/hydra/whatweb/
+  ffuf/john/impacket/socat/proxychains4，逐包容错）+ GitHub release 表
+  （httpx/subfinder/naabu/dnsx/katana/tlsx/notify/interactsh/gitleaks/chisel/
+  amass/dalfox/feroxbuster/gobuster）+ pip 组（wafw00f/impacket/semgrep/
+  pwntools）+ SecLists 字典（/opt/SecLists）+ 公文字体（COPY 仓库内
+  report/fonts，docx→PDF 不再依赖运行期下载）。
+- **基础镜像 Python 3.12→3.11**：impacket/semgrep 等工具链兼容性更稳。
+- **下载全加超时**：nuclei/工具下载 --max-time/--connect-timeout，构建机
+  网络半死时快速失败而不是无限挂起。
+
+### 修复
+
+- **netexec 移除出自动安装**（install.sh 与镜像同口径）：NetExec 2026 起
+  商业化，PyPI 发行文件全部撤下（/simple/netexec 404），pip 装必失败；
+  hosttools 条目注明需从 GitHub 源码安装。bookworm 源没有 nikto，镜像
+  逐包容错跳过（体检页如实显示）。
+
+## [0.4.53] - 2026-11-05
+
+> 图片预览缩放补齐：任务总览与漏洞详情的文档分页预览此前仍是静态 img，
+> v0.4.48 的缩放组件漏掉了这三处——大图（2250x1500 曲线图、Word/PDF 转图页）
+> 看不清细节也不能放大。
+
+### 修复
+
+- **任务总览图片预览接入缩放组件**：滚轮缩放（0.5x–8x）、拖拽平移、双击
+  还原/放大；标题/描述/下载按钮信息不变。
+- **文档分页预览同样接入**（任务总览 + 漏洞详情两处）：Word/PDF 每页转图后
+  可缩放查看，分页控件移入 footer 插槽，翻页时缩放状态自动重置。
+- ZoomableImageDialog 新增 footer 可选插槽（供分页等附加控件复用）。
+
+## [0.4.52] - 2026-11-05
+
+> 借鉴 raptor 认识论闸门 + CVEngine triage 三重夹逼：critical/high 漏洞必须附
+> 可机械复现的验证凭据（HTTP 状态码/curl 命令输出/工具命中结果），纯版本匹配
+> 不再能作为漏洞证据——发行版 backport 补丁不改版本号，版本匹配 ≠ 漏洞。
+
+### 新增
+
+- **机械验证凭据校验**（`validateMechanicalEvidence`）：report_finding 上报
+  critical/high 时检查 evidence 是否包含机械验证信号（HTTP/1.x 响应头、curl/
+  sqlmap/nuclei 输出、状态码、JSON 字段、响应头字段）。无凭据时回灌中文纠正
+  提示，模型可在同会话补证据或降级——「可能存在」不是 finding，「实际拿到」才是。
+- **版本匹配单独拦截**：evidence 只有 version/banner/server 头匹配而无行为级
+  验证时，提示用 http_probe/curl 实际触发目标，或降为 medium 注明
+  「版本匹配，行为未验证」。medium/low 不做机械验证校验（低危经常只有一句
+  说明，过度校验阻碍正常上报）。
+
+
+## [0.4.51] - 2026-11-05
+
+> 用户反馈主 agent 干活不派任务。数据分析：mainagent 249 次 Bash 调用 vs 仅 10 次
+> add_intent——大量 Bash 里出现了 curl 打目标、dig 解析等应该派给 worker 的操作。
+
+### 修复
+
+- **mainagent 角色边界硬规则**：prompt 新增「角色边界硬规则」段——Bash 仅限
+  本地文件操作（报告编辑/图片处理），**严禁用 Bash 与目标系统交互**。
+  判断标准：Bash 命令里出现目标 IP/域名/URL = 越权，应写成 add_intent 派下去。
+  此前 prompt 虽说"你不亲自探索"但没有硬规则约束 Bash 的使用场景。
+
+## [0.4.50] - 2026-11-05
+
+> 红队工作流差距审计——从渗透测试工程师视角逐环节检查平台功能覆盖，
+> 补齐 worker 工具权限 + 充实红队后渗透 skill。
+
+### 新增 / 优化
+
+- **Worker 工具权限扩展**：新增 `expand_digest`（展开冷区折叠节点完整内容）、
+  `list_untested_assets`（自行补漏未测资产）、`list_goals`（感知目标完成进度）
+  ——worker 不再只被动执行，有了自主判断方向完成的工具面。
+- **redteam-ops skill 大幅充实**：从 106 行扩展到 ~100 行结构化方法论——
+  Linux/Windows 提权清单、横向移动（pth/隧道/凭据喷射）、Windows 域专项
+  （Kerberoasting/DCSync/BloodHound）、数据获取纪律、证据绑定。
+
+## [0.4.49] - 2026-11-04
+
+> 全流程审计修复批次：拦截规则误伤清理（322 条审批积压根因）+ worker 提示词
+> 边界编号修正 + record_fact 单次上限。
+
+### 修复
+
+- **拦截规则误伤清理**：「数据外泄管道」（158 次命中=所有 POST 请求）、「删除类
+  接口路径」（80 次=测删除端点是正常渗透行为）、「rm -rf」（22 次=工作目录
+  清理合法）、「破坏性系统命令」（44 次=payload 里的字符串误匹配）——四条
+  误伤率最高的规则已停用，Kali pending 审批 322→0。
+- **record_fact 单次 facts 数组上限 10 条**：防图谱灌爆。
+- **continues 状态校验放宽**：只拒 running，open 允许（暂停回退合理接续）。
+- **worker 边界编号修正**：新增第 3 条「意图粒度过粗时的自处理」，全部条目
+  重编为 1-9。
+- **AddCompanyScopeAuto ON CONFLICT 修复**。
+
+## [0.4.48] - 2026-11-04
+
+> 三个优化：①现场证据图片预览支持滚轮缩放/拖拽/双击还原——报告阅读时需要
+> 放大 URL/参数/响应特征细节，静态图看不清导致误判；②发现页批量导出新增
+> Word 格式（每条漏洞独立 .docx 打包 .zip）；③MD 导出格式改进。
+
+### 新增 / 优化
+
+- **图片预览滚轮缩放**：`ZoomableImageDialog` 组件——滚轮缩放（0.5x–8x）、
+  拖拽平移（scale>1 时自动切 grab cursor）、双击还原/放大到 3x、还原按钮。
+  漏洞详情页图片预览已替换。
+- **发现页批量 Word 导出**（`docx-zip` 格式）：每条漏洞独立 .docx（含完整
+  公文格式/封面/资产名映射/复测记录/证据图），打包 .zip；前端导出面板新增
+  "Word 批量导出"选项。
+- **MD 导出改进**：每条漏洞补充发现者（Worker）字段；证据标题从「证据」改为
+  「证据 / PoC」更清晰；明文保真口径标注。
+
+## [0.4.47] - 2026-11-04
+
+> 用户反馈「从任务证据中挑选」需要人工操作——扫到就归才是正确做法。
+> 根因：worker 先 save_evidence、后 report_finding，此时证据 finding_id 为空。
+
+### 新增
+
+- **report_finding 回溯归属**：漏洞落库后自动把同一意图运行目录
+  （/i<intentID>/）下所有 finding_id 为空的证据一次性归属到本漏洞。
+  同一意图是天然的 provenance 边界——不会误绑其他意图的证据。
+  返回值 evidence_note 告知模型自动归属了几条。
+
 ## [0.4.46] - 2026-11-04
 
 > 关键根因修复：task 12 首轮意图仍是总目标复读。根因不是 planner——是

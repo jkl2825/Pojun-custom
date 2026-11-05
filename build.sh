@@ -98,10 +98,16 @@ if [ -z "${POJUN_BUILD_VERSION:-}" ]; then
   fi
 fi
 # Release tags are commonly passed as v0.3.3; keep the binary version consistent.
+POJUN_BUILD_VERSION="${POJUN_BUILD_VERSION#custom/}"
 POJUN_BUILD_VERSION="${POJUN_BUILD_VERSION#v}"
 POJUN_OUTPUT_DIR="${POJUN_OUTPUT_DIR:-dist}"
 POJUN_PACKAGE_DIR="${POJUN_PACKAGE_DIR:-$POJUN_OUTPUT_DIR}"
 POJUN_UPX_ARGS="${POJUN_UPX_ARGS:---best --lzma}"
+# Downstream builds always identify both the upstream base and local source.
+# Explicitly passing an empty patch marker is reserved for official builds.
+POJUN_LOCAL_PATCH="${POJUN_LOCAL_PATCH-custom-source}"
+POJUN_SOURCE_REVISION="${POJUN_SOURCE_REVISION:-$(git rev-parse HEAD 2>/dev/null || true)}"
+POJUN_UPSTREAM_REVISION="${POJUN_UPSTREAM_REVISION:-$(git rev-parse refs/tags/v0.4.54 2>/dev/null || true)}"
 
 if [ "${POJUN_RELEASE}" = "1" ]; then
   POJUN_TARGETS="${POJUN_TARGETS:-$RELEASE_TARGETS_DEFAULT}"
@@ -226,7 +232,7 @@ build_target() {
   go build \
     -tags embedui \
     -trimpath \
-    -ldflags "-s -w -buildid= -X main.version=${POJUN_BUILD_VERSION}" \
+    -ldflags "-s -w -buildid= -X main.version=${POJUN_BUILD_VERSION} -X github.com/chu0119/pojun/server.LocalPatchVersion=${POJUN_LOCAL_PATCH} -X github.com/chu0119/pojun/server.SourceRevision=${POJUN_SOURCE_REVISION} -X github.com/chu0119/pojun/server.UpstreamRevision=${POJUN_UPSTREAM_REVISION}" \
     -o "$output" \
     ./cmd/pojun
 

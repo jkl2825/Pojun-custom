@@ -76,6 +76,20 @@ const (
 
 var relCache = &releaseCache{}
 
+// Local builds are source-maintained downstreams. This marker is deliberately
+// non-empty by default: forgetting a linker flag must not enable replacement
+// by an unrelated official binary. Official builds may explicitly set it empty.
+var LocalPatchVersion = "custom-source"
+var UpstreamRevision = ""
+var SourceRevision = ""
+
+func localUpdateBlockReason() string {
+	if LocalPatchVersion == "" {
+		return ""
+	}
+	return "当前为本地定制构建（" + LocalPatchVersion + "），已禁用官方二进制一键更新和文件回滚。请先合并上游源码、隔离验证，再部署固定定制镜像；回滚请使用已验证的定制镜像。"
+}
+
 // get 返回最新 Release，命中缓存则不访问网络。
 //
 // 取数期间一直持有锁：并发请求会排队等同一次查询的结果，而不是各自去打 GitHub
@@ -215,14 +229,22 @@ func (s *Server) updateCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	boot := bootUpdateState()
 	out := map[string]any{
-		"current":     current,
-		"mode":        mode,
-		"os":          runtime.GOOS,
-		"arch":        runtime.GOARCH,
-		"has_backup":  selfupdate.HasBackup(),
-		"repo":        selfupdate.Repo,
-		"boot_notice": boot.Detail,
-		"rolled_back": boot.RolledBack,
+		"current":              current,
+		"mode":                 mode,
+		"os":                   runtime.GOOS,
+		"arch":                 runtime.GOARCH,
+		"has_backup":           selfupdate.HasBackup(),
+		"repo":                 selfupdate.Repo,
+		"boot_notice":          boot.Detail,
+		"rolled_back":          boot.RolledBack,
+		"local_patch":          LocalPatchVersion,
+		"upstream_revision":    UpstreamRevision,
+		"source_revision":      SourceRevision,
+		"self_update_disabled": LocalPatchVersion != "",
+	}
+	if reason := localUpdateBlockReason(); reason != "" {
+		out["reason"], out["has_update"], out["comparable"] = reason, false, false
+		out["has_backup"] = false // file rollback is not a verified image rollback
 	}
 
 	// 顶栏提示走缓存（默认）；用户点"检查更新"时带 force=1 强制回源。
@@ -255,7 +277,10 @@ func (s *Server) updateCheck(w http.ResponseWriter, r *http.Request) {
 	cmp, comparable := selfupdate.CompareVersions(current, latest)
 	out["comparable"] = comparable
 	out["has_update"] = comparable && cmp < 0
-	if !comparable {
+	if reason := localUpdateBlockReason(); reason != "" {
+		out["upstream_has_update"] = comparable && cmp < 0
+		out["has_update"], out["reason"] = false, reason
+	} else if !comparable {
 		// 开发构建（dev / git describe 带后缀）没有可比较的版本号。放行只会
 		// 用正式版覆盖掉本地正在调试的二进制，所以直接不给更新。
 		out["reason"] = fmt.Sprintf("当前版本 %q 不是正式发布版本，已禁用一键更新", current)
@@ -268,6 +293,10 @@ func (s *Server) updateCheck(w http.ResponseWriter, r *http.Request) {
 // 立刻返回 202，实际工作在后台 goroutine 上跑：整包下载可能要几分钟，
 // 挂在请求上会被反代超时掐断。进度走 /api/update/stream。
 func (s *Server) updateApply(w http.ResponseWriter, r *http.Request) {
+	if reason := localUpdateBlockReason(); reason != "" {
+		writeErr(w, http.StatusConflict, reason)
+		return // reject before network, staging, or a restart request
+	}
 	current := BuildVersion
 
 	// 走缓存：确保装上的就是用户在界面上看到并确认的那个版本。
@@ -313,6 +342,10 @@ func (s *Server) updateApply(w http.ResponseWriter, r *http.Request) {
 
 // updateRollback 主动退回上一版本（换装前备份的 pojun.old）。
 func (s *Server) updateRollback(w http.ResponseWriter, r *http.Request) {
+	if reason := localUpdateBlockReason(); reason != "" {
+		writeErr(w, http.StatusConflict, reason)
+		return
+	}
 	if _, running := updHub.snapshot(); running {
 		writeErr(w, 409, "更新正在进行中，无法回滚")
 		return

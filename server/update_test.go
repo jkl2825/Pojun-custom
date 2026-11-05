@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -151,5 +153,65 @@ func TestReleaseCacheDoesNotPoisonOnCallerCancel(t *testing.T) {
 	}
 	if rel == nil || rel.TagName != "v0.3.8" {
 		t.Fatalf("应拿到正常结果，得到 %+v", rel)
+	}
+}
+
+func TestLocalBuildUpdateCheckKeepsUpstreamInfoButBlocksInstall(t *testing.T) {
+	oldPatch, oldVersion, oldCache := LocalPatchVersion, BuildVersion, relCache
+	t.Cleanup(func() { LocalPatchVersion, BuildVersion, relCache = oldPatch, oldVersion, oldCache })
+	LocalPatchVersion, BuildVersion = "test-downstream", "0.4.54"
+	relCache = newTestCache(func(context.Context, *http.Client) (*selfupdate.Release, error) {
+		return &selfupdate.Release{TagName: "v0.4.55", Body: "upstream changes"}, nil
+	})
+	rr := httptest.NewRecorder()
+	new(Server).updateCheck(rr, httptest.NewRequest(http.MethodGet, "/api/update/check", nil))
+	var out map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if rr.Code != 200 || out["self_update_disabled"] != true || out["has_update"] != false || out["upstream_has_update"] != true || out["latest"] != "v0.4.55" || out["reason"] == "" {
+		t.Fatalf("custom build policy lost: code=%d out=%+v", rr.Code, out)
+	}
+	// A network failure must not remove local build protection from the response.
+	relCache = newTestCache(func(context.Context, *http.Client) (*selfupdate.Release, error) { return nil, errors.New("offline") })
+	rr = httptest.NewRecorder()
+	new(Server).updateCheck(rr, httptest.NewRequest(http.MethodGet, "/api/update/check", nil))
+	out = nil
+	_ = json.Unmarshal(rr.Body.Bytes(), &out)
+	if out["self_update_disabled"] != true || out["has_update"] != false || out["reason"] == "" {
+		t.Fatalf("offline removed protection: %+v", out)
+	}
+}
+
+func TestLocalBuildApplyAndRollbackRejectBeforeAnySideEffect(t *testing.T) {
+	oldPatch, oldCache := LocalPatchVersion, relCache
+	t.Cleanup(func() { LocalPatchVersion, relCache = oldPatch, oldCache })
+	LocalPatchVersion = "test-downstream"
+	calls := 0
+	relCache = newTestCache(func(context.Context, *http.Client) (*selfupdate.Release, error) {
+		calls++
+		return nil, errors.New("must not fetch")
+	})
+	s := new(Server)
+	for name, handle := range map[string]func(http.ResponseWriter, *http.Request){"apply": s.updateApply, "rollback": s.updateRollback} {
+		rr := httptest.NewRecorder()
+		handle(rr, httptest.NewRequest(http.MethodPost, "/api/update/"+name, nil))
+		if rr.Code != http.StatusConflict {
+			t.Fatalf("%s code=%d body=%s", name, rr.Code, rr.Body.String())
+		}
+	}
+	if calls != 0 {
+		t.Fatal("blocked install fetched a release")
+	}
+	select {
+	case <-RestartRequested():
+		t.Fatal("blocked mutation requested restart")
+	default:
+	}
+}
+
+func TestLocalBuildMarkerDefaultIsFailClosed(t *testing.T) {
+	if LocalPatchVersion == "" {
+		t.Fatal("unmarked source builds must not accept official binary replacement")
 	}
 }

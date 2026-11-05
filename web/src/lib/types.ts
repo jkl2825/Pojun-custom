@@ -1710,6 +1710,12 @@ export interface FindingTrafficDetail {
 export interface UpdateCheck {
   /** 当前运行的版本；开发构建为 "dev" 或 git describe 的带后缀形式。 */
   current: string;
+  /** 本地定制构建只能通过源码合并后部署，不能替换为官方二进制。 */
+  local_patch?: string;
+  upstream_revision?: string;
+  source_revision?: string;
+  self_update_disabled?: boolean;
+  upstream_has_update?: boolean;
   /** 运行形态。docker 下换装只作用于容器可写层，重建容器会退回镜像版本。 */
   mode: "docker" | "binary";
   os: string;
