@@ -53,7 +53,11 @@ RUN set -eux; \
 # @playwright/cli：提供 playwright-cli，装完顺带 --help 验证可执行。
 # 再装 playwright（提供浏览器管理），装完用 --with-deps 预置 chromium 及其系统依赖，
 # 这样容器内 MCP/CLI 首次启动即可用，不再联网下载浏览器。
-RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@latest \
+#
+# 版本固定（2026-11-06）：@latest 的 cli/mcp 依赖 playwright-core@1.65.0，而该
+# 版本在 npm 上并未发布（404，只有 1.65.0-beta），构建报 ETARGET 直接失败。
+# 钉到依赖已发布的一组：mcp 0.0.83 / cli 0.1.22 / playwright 1.64.1。
+RUN npm install -g @playwright/mcp@0.0.83 @playwright/cli@0.1.22 playwright@1.64.1 \
     && playwright-cli --help \
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*

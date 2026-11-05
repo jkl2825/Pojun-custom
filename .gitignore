@@ -71,3 +71,6 @@ peers/
 
 # 本地配置备份（可能含凭据），一律不入库
 .env.bak*
+
+# 本地验证工具：能用容器私钥签 token，不进仓库
+scripts/local-jwt.py
