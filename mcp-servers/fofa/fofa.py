@@ -24,7 +24,11 @@ load_dotenv()
 
 mcp = FastMCP("fofasearch")
 
-FOFA_API_BASE = "https://fofa.info/api/v1/search/all"
+# 接口地址可配：官方是 fofa.info，另有兼容官方契约的第三方通道
+# （如 fafaapi.info）。只换域名不换路径——查询语法与返回字段沿用同一套。
+FOFA_API_BASE = os.getenv("FOFA_API_BASE", "https://fofa.info/api/v1/search/all").rstrip("/")
+if not FOFA_API_BASE.endswith("/api/v1/search/all"):
+    FOFA_API_BASE = FOFA_API_BASE + "/api/v1/search/all"
 USER_AGENT = "fofa-mcp/1.0"
 
 # Prefer env (Grok config.toml env=...); fall back to .env file.
