@@ -22,6 +22,7 @@ type SettlementReconciliation struct {
 	BlockedIntents  int // 撞墙停放的方向
 	TotalFindings   int
 	NoEvidence      int // 证据字段为空的 finding
+	FindingsPending int // 仍是 pending 的漏洞（未分拣即交付）
 	GoalsMet        int // 已标记 met 的目标
 	GoalsNoReason   int // met 但没有留下「凭什么证明」的目标
 	ExecutedIntents int // 已执行（done/stopped/exhausted）的方向
@@ -39,8 +40,9 @@ FROM exploration_nodes WHERE exploration_id=$1`, s.expID).
 	if err != nil {
 		return r, err
 	}
-	err = s.db.QueryRow(`SELECT count(*), count(*) FILTER (WHERE COALESCE(btrim(evidence),'')='')
-FROM findings WHERE task_id=$1`, taskID).Scan(&r.TotalFindings, &r.NoEvidence)
+	err = s.db.QueryRow(`SELECT count(*), count(*) FILTER (WHERE COALESCE(btrim(evidence),'')=''),
+  count(*) FILTER (WHERE status='pending')
+FROM findings WHERE task_id=$1`, taskID).Scan(&r.TotalFindings, &r.NoEvidence, &r.FindingsPending)
 	if err != nil {
 		return r, err
 	}
@@ -64,6 +66,9 @@ func (r SettlementReconciliation) Summary() string {
 	}
 	if r.NoEvidence > 0 {
 		parts = append(parts, fmt.Sprintf("其中 %d 个无证据（交付前需补证或标注）", r.NoEvidence))
+	}
+	if r.FindingsPending > 0 {
+		parts = append(parts, fmt.Sprintf("其中 %d 个仍待分拣（未分拣即交付 = 结论未经复核）", r.FindingsPending))
 	}
 	if r.GoalsMet > 0 {
 		verified := r.GoalsMet - r.GoalsNoReason
