@@ -1676,6 +1676,10 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			if err := t.ts.SetNodeState(goal, "met"); err != nil {
 				log.Printf("[prove_goal] task=%d 目标状态写入失败 goal=%d: %v", t.taskID, goal, err)
 			}
+			// 留痕：证据 id + 理由，事后才能区分「被证明」与「被声称」。
+			if err := t.ts.RecordGoalProof(goal, ev, a.Reason); err != nil {
+				log.Printf("[prove_goal] task=%d 证明留痕写入失败 goal=%d: %v", t.taskID, goal, err)
+			}
 			// 每标记一个目标 met，就检查本任务是否【所有目标】都已 met；若是，自动判定
 			// 任务完成（置 GoalMet），无需再依赖模型显式调 goal_met。
 			if goals, err := t.ts.ListByKind(db.KindGoal, 1000); err == nil && len(goals) > 0 {

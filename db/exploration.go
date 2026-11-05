@@ -531,6 +531,31 @@ WHERE id=$2 AND exploration_id=$3 AND kind='goal'`, payloadJSON, id, s.expID)
 	return err
 }
 
+// RecordGoalProof 把「凭什么判这个目标 met」留痕：证据 id + 理由 + 状态。
+//
+// 为什么要留：prove_goal 原先只把 state 改成 met，reason 参数解析后从未落库，
+// 事后无法回答「这个目标是被证明的，还是被声称的」。2026-11-05 实测任务 404
+// 的 5 个目标里有 3 个证据节点与目标要求并不对应（要求经 8001 网关取 flag，
+// 证据却是 l1-jump 的 flag07），但库里一个字没留，只能靠人工逐条比对才发现。
+//
+// state 固定记 claimed：核查通过是另一个动作，不能由写这条记录的人自己宣布。
+func (s *ExplorationStore) RecordGoalProof(id, evidenceID int64, reason string) error {
+	payloadJSON, err := jsonArg(map[string]any{
+		"proof": map[string]any{
+			"evidence_id": evidenceID,
+			"reason":      strings.TrimSpace(reason),
+			"state":       "claimed",
+		},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE exploration_nodes
+SET payload = COALESCE(payload,'{}'::jsonb) || $1::jsonb
+WHERE id=$2 AND exploration_id=$3 AND kind='goal'`, payloadJSON, id, s.expID)
+	return err
+}
+
 // MergeIntentPayload merges fields into an intent node's payload (jsonb ||).
 // Used by the engine's run settlement to persist run telemetry (wall_ms 等) on
 // the intent itself, so「这条方向烧了多久」在图上是可审计的，而不只活在 activity。

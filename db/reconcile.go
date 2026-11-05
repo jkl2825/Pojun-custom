@@ -22,6 +22,8 @@ type SettlementReconciliation struct {
 	BlockedIntents  int // 撞墙停放的方向
 	TotalFindings   int
 	NoEvidence      int // 证据字段为空的 finding
+	GoalsMet        int // 已标记 met 的目标
+	GoalsNoReason   int // met 但没有留下「凭什么证明」的目标
 	ExecutedIntents int // 已执行（done/stopped/exhausted）的方向
 }
 
@@ -39,6 +41,16 @@ FROM exploration_nodes WHERE exploration_id=$1`, s.expID).
 	}
 	err = s.db.QueryRow(`SELECT count(*), count(*) FILTER (WHERE COALESCE(btrim(evidence),'')='')
 FROM findings WHERE task_id=$1`, taskID).Scan(&r.TotalFindings, &r.NoEvidence)
+	if err != nil {
+		return r, err
+	}
+	// 目标验收的留痕：met 但没写 proof.reason，说明「模型认为完成」没有任何
+	// 可复核依据（2026-11-05 实测：任务 404 的 5 个目标里 3 个证据与目标要求不符）。
+	err = s.db.QueryRow(`SELECT
+  count(*) FILTER (WHERE state='met'),
+  count(*) FILTER (WHERE state='met' AND COALESCE(btrim(payload->'proof'->>'reason'),'')='')
+FROM exploration_nodes WHERE exploration_id=$1 AND kind='goal'`, s.expID).
+		Scan(&r.GoalsMet, &r.GoalsNoReason)
 	return r, err
 }
 
@@ -52,6 +64,11 @@ func (r SettlementReconciliation) Summary() string {
 	}
 	if r.NoEvidence > 0 {
 		parts = append(parts, fmt.Sprintf("其中 %d 个无证据（交付前需补证或标注）", r.NoEvidence))
+	}
+	if r.GoalsMet > 0 {
+		verified := r.GoalsMet - r.GoalsNoReason
+		parts = append(parts, fmt.Sprintf("目标 %d 个，其中 %d 个留有证明理由、%d 个仅为模型声称",
+			r.GoalsMet, verified, r.GoalsNoReason))
 	}
 	return "收官对账：" + joinComma(parts)
 }
