@@ -87,6 +87,22 @@ FROM findings WHERE task_id=$1`, taskID)
 		return 0, err
 	}
 
+	// 环境级否证：我们的价值大头在这里（「这个环境里什么不成立」），而它写在
+	// 事实里而不是 findings 里——findings 的分拣率实测为 0，靠它取 boundary
+	// 会得到一张全空的知识表。这里单独归一类，不假装它属于某个漏洞类。
+	if facts := s.negatedFacts(taskID, 3); len(facts) >= 2 {
+		if _, err := s.db.Exec(`INSERT INTO knowledge(scope_key, vuln_class, method, boundary, hits, last_task_id)
+VALUES ($1,'否证（环境）','',$2,$3,$4)
+ON CONFLICT (scope_key, vuln_class) DO UPDATE SET
+  boundary = EXCLUDED.boundary,
+  hits = knowledge.hits + EXCLUDED.hits,
+  last_task_id = EXCLUDED.last_task_id,
+  updated_at = now()`,
+			s.knowledgeScope(taskID), joinTop(facts, 3), len(facts), taskID); err != nil {
+			return 0, err
+		}
+	}
+
 	scope := s.knowledgeScope(taskID)
 	n := 0
 	for class, a := range groups {
@@ -174,4 +190,44 @@ func joinTop(items []string, n int) string {
 		out = out[:n]
 	}
 	return strings.Join(out, "；")
+}
+
+// negatedFacts 取本任务里明确写成否证的事实（「不成立/否证/零命中/不存在」）。
+//
+// 为什么不从 findings.boundary 取：实测任务 404 的 64 条 finding 全部停在
+// pending，没有一条被判误报，靠它取否证面只会得到空表；而 worker 写事实时
+// 本来就会写明「假设 H 不成立（observed）」，那里才是否证的真实来源。
+func (s *ExplorationStore) negatedFacts(taskID int64, limit int) []string {
+	rows, err := s.db.Query(`SELECT COALESCE(p.summary,'')
+FROM exploration_nodes p JOIN explorations e ON e.id=p.exploration_id
+WHERE p.kind='fact' AND e.id=(SELECT exploration_id FROM tasks WHERE id=$1)
+  AND (p.payload->>'summary') ~ '(不成立|否证|零命中|不存在|不是)'
+ORDER BY p.created_at DESC LIMIT 50`, taskID)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []string
+	seen := map[string]bool{}
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			continue
+		}
+		s = firstLine(s)
+		if s == "" || seen[s] {
+			continue
+		}
+		// 排除「假设成立」这类正结论：正则里的「不是/不存在」常出现在正文后半段，
+		// 会把「H 成立…（不是 X）」整条捞进来，污染否证面。
+		if strings.Contains(s, "成立") && !strings.Contains(s, "不成立") {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
 }
