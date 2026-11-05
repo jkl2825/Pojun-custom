@@ -414,9 +414,16 @@ func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, pre
 		if err == nil {
 			stamp := time.Now().UTC().Format("2006-01-02 15:04")
 			appendix := utf8Clean(fmt.Sprintf("\n\n--- 二次确认(worker=%s, %s UTC) ---\n%s", in.Worker, stamp, in.Evidence))
-			// 严重度只升不降（2026-11-05）：原实现无条件用本次上报覆盖，先报 high
-			// 后被 medium 二次确认就会静默降级，且不留痕。取两者较高值。
-			sev := higherSeverity(dupeSeverity, in.Severity)
+			// 定级默认沿用原值，冲突只记录不自动改写（2026-11-05）。
+			//
+			// 原实现无条件用本次上报覆盖 = last-write-wins：先报 high 后被 medium
+			// 复核会静默降级且无留痕。但反过来改「只升不降」同样错——首报 high
+			// 定错、二次确认发现应为 medium 时，正当更正会被挡死。
+			// 正确口径是「每次由正文重裁」：这里不替人裁决，只把冲突写进证据。
+			sev, conflict := resolveSeverity(dupeSeverity, in.Severity)
+			if conflict {
+				appendix += "\n[定级冲突] 原 " + dupeSeverity + " / 本次 " + in.Severity + " —— 未自动改写，须按报告等级法对正文重新比对后显式修改"
+			}
 			if _, err := tx.Exec(`UPDATE findings SET evidence = evidence || $2, severity = $3 WHERE id=$1`,
 				dupeID, appendix, sev); err != nil {
 				return nil, err
@@ -556,34 +563,24 @@ func (d *DB) SetFindingReportVersionByNodeID(ctx context.Context, nodeID int64, 
 	return
 }
 
-// higherSeverity 返回两个严重度里较高的那个，未知值按最低处理。
+// resolveSeverity 决定二次确认时的定级：**默认沿用原值，冲突只报告不改写**。
 //
-// 用途：同一 fingerprint 被二次确认时，严重度只能升不能降。原实现无条件用
-// 本次上报覆盖，先 high 后被 medium 复核就会静默降级且不留痕——而交付物里
-// 的定级直接决定客户看什么，降级必须是显式动作而不是副作用。
+// 为什么不是 last-write-wins：原实现无条件覆盖，先 high 后被 medium 复核会
+// 静默降级，交付物定级随上报顺序漂移，且无任何留痕。
 //
-// 这套「只升不降」在身份包（grok 换机移交）里有对应条文先例：
-// vuln-report-format 禁「比上一份多一个字段就跳档」，hunt-iter 要求「读磁盘现稿」。
-func higherSeverity(a, b string) string {
-	rank := func(s string) int {
-		switch strings.ToLower(strings.TrimSpace(s)) {
-		case "critical":
-			return 4
-		case "high":
-			return 3
-		case "medium":
-			return 2
-		case "low":
-			return 1
-		default:
-			return 0
-		}
+// 为什么也不是「只升不降」：那样首报 high 定错、二次确认发现应为 medium 时，
+// 正当更正反而被挡死——等于用一种失真换另一种失真。
+//
+// 等级的真源是报告正文（vuln-report-format 要求按证据逐条比对），这里不替人
+// 裁决：保留原值，把 conflict 交回调用方写进证据，由人/planner 显式修改。
+func resolveSeverity(current, incoming string) (severity string, conflict bool) {
+	cur := strings.TrimSpace(current)
+	inc := strings.TrimSpace(incoming)
+	if cur == "" {
+		return inc, false // 原值为空 = 首次定级，直接采用
 	}
-	if strings.TrimSpace(a) == "" {
-		return b
+	if inc == "" || strings.EqualFold(cur, inc) {
+		return cur, false
 	}
-	if rank(b) > rank(a) {
-		return b
-	}
-	return a
+	return cur, true // 保留原值，把冲突交回给人/planner 重裁
 }

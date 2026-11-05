@@ -2,23 +2,35 @@ package db
 
 import "testing"
 
-// TestHigherSeverity 锁住「严重度只升不降」。
+// TestResolveSeverity 锁住「定级默认沿用原值、冲突只报告不改写」。
 //
-// 背景：同一 fingerprint 二次确认时原实现无条件覆盖 severity，先报 high
-// 后被 medium 复核就会静默降级，交付物定级随上报顺序漂移，且没有任何留痕。
-func TestHigherSeverity(t *testing.T) {
-	cases := []struct{ a, b, want string }{
-		{"high", "medium", "high"},       // 高不被低覆盖
-		{"medium", "high", "high"},       // 低可被高抬升
-		{"critical", "high", "critical"}, // 最高档不被降
-		{"", "medium", "medium"},         // 原值为空 → 采用新值
-		{"high", "", "high"},             // 新值为空 → 保留原值
-		{"HIGH", "medium", "HIGH"},       // 大小写不敏感，保留原写法
-		{"unknown", "low", "low"},        // 未知值视为最低
+// 背景（2026-11-05，身份包对照分析）：去重路径原实现无条件用本次上报覆盖
+// severity，先报 high 后被 medium 复核会静默降级、无留痕。
+//
+// 但「只升不降」同样是错的：首报 high 定错、二次确认发现应为 medium 时，
+// 正当更正会被挡死。定级的真源是报告正文，这里不替人裁决——保留原值，
+// 把冲突交给调用方写进证据，由人/planner 显式修改。
+func TestResolveSeverity(t *testing.T) {
+	cases := []struct {
+		name             string
+		current, coming  string
+		wantSev          string
+		wantConflictFlag bool
+	}{
+		{"降级不自动执行", "high", "medium", "high", true},
+		{"升级也不自动执行", "medium", "high", "medium", true},
+		{"首次定级直接采用", "", "medium", "medium", false},
+		{"本次为空则沿用原值", "high", "", "high", false},
+		{"大小写不同视为同级", "HIGH", "high", "HIGH", false},
+		{"未知值与正常值冲突", "unknown", "low", "unknown", true},
 	}
 	for _, c := range cases {
-		if got := higherSeverity(c.a, c.b); got != c.want {
-			t.Errorf("higherSeverity(%q, %q) = %q，期望 %q", c.a, c.b, got, c.want)
-		}
+		t.Run(c.name, func(t *testing.T) {
+			sev, conflict := resolveSeverity(c.current, c.coming)
+			if sev != c.wantSev || conflict != c.wantConflictFlag {
+				t.Fatalf("resolveSeverity(%q, %q) = (%q, %v)，期望 (%q, %v)",
+					c.current, c.coming, sev, conflict, c.wantSev, c.wantConflictFlag)
+			}
+		})
 	}
 }
