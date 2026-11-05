@@ -81,6 +81,18 @@ const escalationSteerMessage = "这条意图已经运行 15 分钟仍没有任�
 	"② 如果卡在某个具体障碍（认证、WAF、路径不通），在总结里写清是什么障碍、试过哪些手段；" +
 	"③ 如果当前路径明显走不通，直接结束本条意图，不要在同一个假设上重复尝试。"
 
+// goallessDoneSummary 是「无 open 目标 + 无 active 意图」收尾时的播报。
+//
+// 原实现无条件写「目标已全部达成」——但阶梯 L4 把 running 意图改成 blocked 后，
+// HasActiveIntent 会转 false，此时是「所有方向都撞墙了」而不是「都达成了」。
+// 播报错了直接误导交付判断：看起来全绿，实际一堆 blocked。
+func goallessDoneSummary(blocked int) string {
+	if blocked > 0 {
+		return fmt.Sprintf("无待执行方向且无在跑意图，任务结束；其中 %d 条方向已标记 blocked（撞墙/阶梯停放），交付前请逐条核对原因", blocked)
+	}
+	return "目标已全部达成，直投意图已执行完毕，任务结束"
+}
+
 // checkEscalation 由 plannerLoop 的独立 ticker 驱动，对运行中的意图执行阶梯判定。
 // ticker 与规划共用同一循环生命周期，worker 完成事件重臂规划心跳不会推迟监督。
 func (e *Engine) checkEscalation(t *Task) {

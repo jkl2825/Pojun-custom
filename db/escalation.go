@@ -79,7 +79,6 @@ WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, level, id, s.expID)
 }
 
 // ParkIntent 把意图停放到 blocked，并写明原因（缺什么、试过什么）。
-//
 // 用 blocked 而不是 stopped/exhausted：
 //   - stopped 是「planner 主动叫停」，语义是方向错误；
 //   - exhausted 是「预算耗尽被掐断」，语义是还没做完、值得接续；
@@ -93,6 +92,19 @@ WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state='running'`, reason
 	}
 	n, _ := res.RowsAffected()
 	return n == 1, nil
+}
+
+// BlockedIntentCount 返回本探索下处于 blocked 的意图数。
+//
+// 用途：任务收尾时区分「目标真的都达成了」和「方向全被停放、没活可干」。
+// 2026-11-05 发现：engine 的 goalless 分支在「无 open 目标 + 无 active 意图」时
+// 直接落 done 并播报「目标已全部达成」——但 L4 阶梯会把 running 意图改成
+// blocked，那时是「全部撞墙」而不是「全部达成」，播报是错的。
+func (s *ExplorationStore) BlockedIntentCount() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT count(*) FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='intent' AND state='blocked'`, s.expID).Scan(&n)
+	return n, err
 }
 
 type intentAdmissionPayload struct {

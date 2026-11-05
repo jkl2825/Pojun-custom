@@ -1075,8 +1075,11 @@ func (e *Engine) plannerLoopWithEscalationTicks(ctx context.Context, t *Task, es
 				if won, err := e.m.SetTaskStatusGuarded(t.ID, "done"); err != nil {
 					log.Printf("[goalless] task %s 收尾落 done 失败: %v", t.ID, err)
 				} else if won {
+					// 播报必须区分「达成」与「全被停放」：阶梯 L4 会把 running 改成
+					// blocked，那时 HasActiveIntent 转 false，走到这里并不是目标达成。
+					blocked, _ := t.Store.BlockedIntentCount()
 					e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
-						Summary: "目标已全部达成，直投意图已执行完毕，任务结束"})
+						Summary: goallessDoneSummary(blocked)})
 				}
 			}
 			return // goalless 分支永不进入 planner.Plan
