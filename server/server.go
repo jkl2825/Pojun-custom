@@ -4240,6 +4240,30 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	findings, _ := t.Store.ListByKind(db.KindFinding, 1000) // 纯漏洞（事实是独立的 KindFact，不进报告）
+	// 与导出（exportTaskDocx）同一口径：剔除误报/重复/忽略/风险接受。
+	//
+	// 2026-11-05 修：此前 Markdown 预览取全量、Word 导出套 ExcludeStatuses，
+	// 同一任务两个交付物内容不同——页面看得到已判误报的漏洞，导出件没有。
+	// 默认对齐导出；需要看全量做复核时加 ?include=all。
+	if r.URL.Query().Get("include") != "all" {
+		if keep, err := s.m.pg.ListFindingsForExport(db.FindingFilter{
+			TaskID: t.ID, ExcludeStatuses: exportExcludeStatuses,
+		}, nil); err == nil {
+			allow := make(map[int64]bool, len(keep))
+			for _, f := range keep {
+				if f.NodeID != nil {
+					allow[*f.NodeID] = true
+				}
+			}
+			filtered := make([]*db.Node, 0, len(findings))
+			for _, n := range findings {
+				if allow[n.ID] {
+					filtered = append(filtered, n)
+				}
+			}
+			findings = filtered
+		}
+	}
 	counts := map[string]int{}
 	for _, ty := range []string{"root_domain", "ip", "subdomain", "app", "service", "endpoint"} {
 		ns, _ := s.m.Assets().QueryByType(ty, 100000, 0)

@@ -816,3 +816,30 @@ func (d *DB) FindingMetaByNodeID(taskID int64) (map[int64]FindingMeta, error) {
 	}
 	return out, rows.Err()
 }
+
+// FindingStatusesByID 批量取 findings 表的分拣状态（id → status）。
+//
+// 为什么需要：agent 的 list_findings 返回的是**图节点**的 state，而节点恒为
+// confirmed；真正会变的 pending/false_positive/duplicate/ignored/risk_accepted
+// 在 findings 表里。agent 看不到这一层，就会把已判误报的漏洞反复重报
+// （2026-11-05 由身份包对照分析发现）。
+func (s *ExplorationStore) FindingStatusesByID(ids []int64) (map[int64]string, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(`SELECT id, COALESCE(status,'pending') FROM findings WHERE id = ANY($1)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[int64]string, len(ids))
+	for rows.Next() {
+		var id int64
+		var st string
+		if err := rows.Scan(&id, &st); err != nil {
+			return nil, err
+		}
+		out[id] = st
+	}
+	return out, rows.Err()
+}

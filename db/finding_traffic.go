@@ -402,19 +402,23 @@ func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, pre
 	fp := FindingFingerprint(in)
 	if in.TaskID > 0 && fp != "" && len(in.AssetIDs) > 0 {
 		var (
-			dupeID     int64
-			dupeNode   int64
-			dupeStatus string
+			dupeID       int64
+			dupeNode     int64
+			dupeStatus   string
+			dupeSeverity string
 		)
-		err := tx.QueryRow(`SELECT id, COALESCE(node_id,0), status FROM findings
+		err := tx.QueryRow(`SELECT id, COALESCE(node_id,0), status, COALESCE(severity,'') FROM findings
 			WHERE task_id=$1 AND fingerprint=$2
 			  AND status IN ('pending','in_progress','confirmed')
-			ORDER BY id LIMIT 1 FOR UPDATE`, in.TaskID, fp).Scan(&dupeID, &dupeNode, &dupeStatus)
+			ORDER BY id LIMIT 1 FOR UPDATE`, in.TaskID, fp).Scan(&dupeID, &dupeNode, &dupeStatus, &dupeSeverity)
 		if err == nil {
 			stamp := time.Now().UTC().Format("2006-01-02 15:04")
 			appendix := utf8Clean(fmt.Sprintf("\n\n--- 二次确认(worker=%s, %s UTC) ---\n%s", in.Worker, stamp, in.Evidence))
+			// 严重度只升不降（2026-11-05）：原实现无条件用本次上报覆盖，先报 high
+			// 后被 medium 二次确认就会静默降级，且不留痕。取两者较高值。
+			sev := higherSeverity(dupeSeverity, in.Severity)
 			if _, err := tx.Exec(`UPDATE findings SET evidence = evidence || $2, severity = $3 WHERE id=$1`,
-				dupeID, appendix, in.Severity); err != nil {
+				dupeID, appendix, sev); err != nil {
 				return nil, err
 			}
 			// 血缘:这个 intent 也(再次)产出了该漏洞节点,planner 链路完整。
@@ -550,4 +554,36 @@ func (d *DB) SetFindingReportVersionByNodeID(ctx context.Context, nodeID int64, 
 		return err
 	})
 	return
+}
+
+// higherSeverity 返回两个严重度里较高的那个，未知值按最低处理。
+//
+// 用途：同一 fingerprint 被二次确认时，严重度只能升不能降。原实现无条件用
+// 本次上报覆盖，先 high 后被 medium 复核就会静默降级且不留痕——而交付物里
+// 的定级直接决定客户看什么，降级必须是显式动作而不是副作用。
+//
+// 这套「只升不降」在身份包（grok 换机移交）里有对应条文先例：
+// vuln-report-format 禁「比上一份多一个字段就跳档」，hunt-iter 要求「读磁盘现稿」。
+func higherSeverity(a, b string) string {
+	rank := func(s string) int {
+		switch strings.ToLower(strings.TrimSpace(s)) {
+		case "critical":
+			return 4
+		case "high":
+			return 3
+		case "medium":
+			return 2
+		case "low":
+			return 1
+		default:
+			return 0
+		}
+	}
+	if strings.TrimSpace(a) == "" {
+		return b
+	}
+	if rank(b) > rank(a) {
+		return b
+	}
+	return a
 }

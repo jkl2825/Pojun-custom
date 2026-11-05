@@ -1225,6 +1225,25 @@ func (t *ToolSet) listFindings() actool.CoreTool {
 				}
 				out = append(out, m)
 			}
+			// 补上分拣状态：节点 state 恒为 confirmed，误导 agent 以为「都是有效漏洞」；
+			// 被判误报/重复/忽略的只体现在 findings 表里。看不到就会重复上报。
+			ids := make([]int64, 0, len(out))
+			for _, m := range out {
+				if fid, ok := m["finding_id"].(int64); ok && fid > 0 {
+					ids = append(ids, fid)
+				}
+			}
+			if len(ids) > 0 {
+				if st, err := t.ts.FindingStatusesByID(ids); err == nil {
+					for _, m := range out {
+						if fid, ok := m["finding_id"].(int64); ok {
+							if s, ok := st[fid]; ok {
+								m["triage_status"] = s
+							}
+						}
+					}
+				}
+			}
 			return jsonResult(out)
 		})
 }
