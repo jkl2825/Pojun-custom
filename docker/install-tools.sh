@@ -118,48 +118,42 @@ done
 # 脚本），而渗透作业按 impacket-smbexec/wmiexec/getST 这些命令名调用。
 # 策略：①codeload master 源码（examples 全量）安装；②无论 ① 成败，都从
 # examples 目录生成双名包装器（impacket-<名> 与 <名>），保证命令一定在。
+# 固定 0.12.0（sdist）：0.13+ 把 smbexec/wmiexec 并进 remcomsvc，命令名变了，
+# 而技能（redteam-ops / active-directory-attack）与 hosttools 体检用的都是
+# impacket-smbexec 这一套名字。示例脚本不随包安装，必须自己拷出来。
+#
+# 另两个必须同时处理的坑（2026-11-06 实测）：
+#  ① 0.12 的 version.py 依赖 pkg_resources，而 setuptools>=81 已移除它；
+#  ② 示例脚本不能拷进 site-packages/impacket/examples/——secretsdump.py 与库
+#     模块同名，覆盖后自引用成环（ImportError: partially initialized module）。
+IMP_VER="0.12.0"
 imp_ok=0
-rm -rf /tmp/impacket-src; mkdir -p /tmp/impacket-src
-for i in 1 2 3; do
-  # 不用 pip git+：那要构建机有 git；codeload tarball 走 CDN，fetch 自带重试
-  if fetch "https://github.com/fortra/impacket/archive/refs/heads/master.tar.gz" /tmp/impacket-src/imp.tar.gz; then
-    tar -xzf /tmp/impacket-src/imp.tar.gz -C /tmp/impacket-src 2>/dev/null || true
-    d="$(find /tmp/impacket-src -maxdepth 1 -type d -name 'impacket-*' | head -1)"
-    [ -n "$d" ] || break
-    python3 -m pip install --no-cache-dir --root-user-action=ignore "$d" >/dev/null 2>&1 \
-      && command -v impacket-smbexec >/dev/null 2>&1 && { imp_ok=1; break; }
-  fi
-  sleep 8
-done
-[ "$imp_ok" = "1" ] && ok "  impacket（源码，含全套示例命令）"
-
-# 包装器兜底：优先用已装包的 examples 目录（源码/wheel 都带），若连 examples
-# 都没有（PyPI 拦截/网络全断），用 pip download 拉 sdist 解出 examples 再生成。
-gen_wrappers(){
-  local ex="$1" f base
-  for f in "$ex"/*.py; do
-    [ -e "$f" ] || continue
-    base="$(basename "$f" .py)"
-    case "$base" in __init__|logger|utils|*_help) continue ;; esac
-    printf '#!/bin/sh\nexec python3 "%s/%s.py" "$@"\n' "$ex" "$base" > "/usr/local/bin/impacket-$base"
-    chmod +x "/usr/local/bin/impacket-$base"
-    command -v "$base" >/dev/null 2>&1 || cp "/usr/local/bin/impacket-$base" "/usr/local/bin/$base"
-  done
-}
-exdir="$(python3 -c 'import impacket, os; print(os.path.join(os.path.dirname(impacket.__file__), "examples"))')" 2>/dev/null || exdir=""
-if [ -z "$exdir" ] || [ -z "$(find "$exdir" -maxdepth 1 -name 'smbexec.py' 2>/dev/null)" ]; then
-  rm -rf /tmp/impsd; mkdir -p /tmp/impsd
-  if python3 -m pip download impacket --no-deps --no-binary :all: -d /tmp/impsd >/dev/null 2>&1; then
-    sd="$(find /tmp/impsd -name 'impacket-*.tar.gz' | head -1)"
-    [ -n "$sd" ] && tar -xzf "$sd" -C /tmp/impsd 2>/dev/null
-    exdir="$(find /tmp/impsd -type d -name examples | head -1)"
+rm -rf /tmp/impsd && mkdir -p /tmp/impsd
+if python3 -m pip download --no-deps --no-binary :all: "impacket==${IMP_VER}" -d /tmp/impsd >/dev/null 2>&1; then
+  sd="$(find /tmp/impsd -name "impacket-${IMP_VER}.tar.gz" | head -1)"
+  if [ -n "$sd" ]; then
+    python3 -m pip install --no-cache-dir --root-user-action=ignore "$sd" >/dev/null 2>&1       && python3 -m pip install --no-cache-dir --root-user-action=ignore "setuptools<81" >/dev/null 2>&1       && imp_ok=1
+    tar -xzf "$sd" -C /tmp/impsd 2>/dev/null || true
+    exsrc="$(find /tmp/impsd -maxdepth 2 -type d -name examples | head -1)"
+    if [ -n "$exsrc" ] && [ -f "$exsrc/smbexec.py" ]; then
+      rm -rf /opt/impacket-examples && mkdir -p /opt/impacket-examples
+      cp "$exsrc"/*.py /opt/impacket-examples/
+      n=0
+      for f in /opt/impacket-examples/*.py; do
+        b="$(basename "$f" .py)"
+        case "$b" in __init__|logger|utils|*_help) continue ;; esac
+        printf '#!/bin/sh
+exec python3 "/opt/impacket-examples/%s.py" "$@"
+' "$b" > "/usr/local/bin/impacket-$b"
+        chmod +x "/usr/local/bin/impacket-$b"
+        n=$((n+1))
+      done
+      [ "$n" -gt 0 ] && ok "  impacket ${IMP_VER} 示例命令 ×${n}（smbexec/wmiexec/secretsdump…）"
+    fi
   fi
 fi
-if [ -n "$exdir" ] && [ -f "$exdir/smbexec.py" ]; then
-  gen_wrappers "$exdir"
-  ok "  impacket 示例命令包装器（impacket-smbexec / wmiexec / secretsdump …）"
-elif [ "$imp_ok" != "1" ]; then
-  warn "  impacket 命令不可用（PyPI 与 GitHub 均不可达；体检页会如实显示缺失）"
+if [ "$imp_ok" != "1" ]; then
+  warn "  impacket 安装失败（PyPI 不可达；体检页会如实显示缺失）"
 fi
 
 # ── SecLists 字典集 ──────────────────────────────────
