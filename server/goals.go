@@ -430,7 +430,12 @@ func (s *Server) createGoals(ctx context.Context, t *Task, emit func(db.Activity
 		if g := strings.TrimSpace(t.Goal); g != "" {
 			log.Printf("[goals] task %s: LLM 目标拆解无产出，回退为「原始目标作为单目标」", t.ID)
 			origin, _ := t.Store.OriginFactID()
-			id, _ := t.Store.AddNode(db.KindGoal, map[string]any{"text": g}, 0, "open", "system", nil)
+			id, err := t.Store.AddNode(db.KindGoal, map[string]any{"text": g}, 0, "open", "system", nil)
+			if err != nil {
+				// 不能吞：这里失败 = 任务没有任何目标可判定，收尾时
+				// 「所有目标已 met」就成了空真（对空集合恒成立）。
+				log.Printf("[goals] task %s 回退目标写入失败: %v", t.ID, err)
+			}
 			if origin > 0 && id > 0 {
 				_ = t.Store.Link(origin, db.RelSpawns, id) // goal descends from the task root (origin fact)
 			}
