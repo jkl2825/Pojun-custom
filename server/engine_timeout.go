@@ -244,6 +244,13 @@ func (e *Engine) settleTaskWithReason(ctx context.Context, t *Task, reason, deta
 			log.Printf("[settle] task %s %s", t.ID, rec.Summary())
 			e.emitActivity(t, db.Activity{Worker: "system", Kind: "text", Summary: rec.Summary()})
 		}
+		// 知识沉淀：把本任务里反复验证的手法（含否证边界）写进作用域知识库。
+		// 只写不读，失败不阻断收尾——沉淀是加分项，不能成为收尾的失败点。
+		if n, err := t.Store.DistillKnowledge(tid); err != nil {
+			log.Printf("[settle] task %s 知识沉淀失败: %v", t.ID, err)
+		} else if n > 0 {
+			log.Printf("[settle] task %s 提炼知识 %d 条", t.ID, n)
+		}
 	}
 	if reason != "timeout" {
 		e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",

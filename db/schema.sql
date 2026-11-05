@@ -563,6 +563,22 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS auth_config JSONB;
 -- 夺旗/评测类交战的提交通道（任务级，由创建方写入，agent 不可写）。
 -- 存在即注册 submit_flag 工具；不存在则该工具在此任务上完全不可见。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS submit_config JSONB;
+
+-- 跨任务知识：按公司隔离（无公司则退回单任务作用域）。
+-- 沉淀单位是「可复用的判别式」而不是某次结论：漏洞类 + 判定条件 + 否证边界。
+CREATE TABLE IF NOT EXISTS knowledge (
+  id BIGSERIAL PRIMARY KEY,
+  scope_key TEXT NOT NULL,            -- company:<id> 或 task:<id>
+  vuln_class TEXT NOT NULL,
+  method TEXT NOT NULL DEFAULT '',    -- 命中条件/打法
+  boundary TEXT NOT NULL DEFAULT '',  -- 在什么情况下不成立（否证面）
+  hits INTEGER NOT NULL DEFAULT 0,    -- 累计命中次数
+  last_task_id BIGINT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (scope_key, vuln_class)
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_scope ON knowledge(scope_key, hits DESC);
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queue_mode TEXT NOT NULL DEFAULT '';
 -- 可选的任务名称;补旧库。空串=未命名,前端展示时回退到描述。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT '';
