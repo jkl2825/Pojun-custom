@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/url"
 	"regexp"
@@ -1665,8 +1666,16 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			if err != nil || evidenceNode == nil || (evidenceNode.Kind != db.KindFact && evidenceNode.Kind != db.KindFinding) {
 				return actool.Errorf("evidence_id 必须是本任务或直接关联任务的事实/漏洞节点"), nil
 			}
-			_ = t.ts.Link(ev, db.RelProves, goal)
-			_ = t.ts.SetNodeState(goal, "met")
+			// 观测层：证据边与目标状态写入失败原本被静默丢弃，而证据边是报告
+			// 与对账的底层依据（丢边 = 交付物少一条溯源，且无任何信号）。
+			// 这里【只记录、不改返回值】，行为与改动前等价；等真实失败样本出现
+			// 再决定是否上事务（2026-11-05 外部评审指出，同批 6 处 Link 均如此）。
+			if err := t.ts.Link(ev, db.RelProves, goal); err != nil {
+				log.Printf("[prove_goal] task=%d 证据边写入失败 goal=%d ev=%d: %v", t.taskID, goal, ev, err)
+			}
+			if err := t.ts.SetNodeState(goal, "met"); err != nil {
+				log.Printf("[prove_goal] task=%d 目标状态写入失败 goal=%d: %v", t.taskID, goal, err)
+			}
 			// 每标记一个目标 met，就检查本任务是否【所有目标】都已 met；若是，自动判定
 			// 任务完成（置 GoalMet），无需再依赖模型显式调 goal_met。
 			if goals, err := t.ts.ListByKind(db.KindGoal, 1000); err == nil && len(goals) > 0 {
