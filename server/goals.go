@@ -118,14 +118,13 @@ func (s *Server) admitTask(t *Task, mode string) (queued bool, err error) {
 	return s.admitTaskWhen(t, mode, false)
 }
 
-// admitPausedTask is the task-control resume path. The paused precondition is
-// checked under the same scheduler lock as admission so a concurrent pause,
-// dequeue or FIFO promotion cannot leave database and Engine state divergent.
-func (s *Server) admitPausedTask(t *Task) (queued bool, err error) {
+// admitResumableTask 在准入锁内检查暂停或终态前提，避免继续操作绕过
+// 并发队列，或与暂停交错后清掉已经持久化的暂停标记。
+func (s *Server) admitResumableTask(t *Task) (queued bool, err error) {
 	return s.admitTaskWhen(t, "resume", true)
 }
 
-func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued bool, err error) {
+func (s *Server) admitTaskWhen(t *Task, mode string, requireResumable bool) (queued bool, err error) {
 	if t == nil {
 		return false, fmt.Errorf("task not found")
 	}
@@ -146,16 +145,15 @@ func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued
 	}
 	defer s.engine.decInflight(t.ID)
 	lifecycle := t.lifecycleSnapshot()
-	if requirePaused {
-		if isTerminalStatus(lifecycle.Status) {
-			return false, fmt.Errorf("终态任务不能执行继续")
-		}
-		if !lifecycle.Paused {
-			return false, fmt.Errorf("仅已暂停的任务可以继续")
-		}
-		mode = s.resumeAdmissionMode(t)
-	}
 	wasTerminal := isTerminalStatus(lifecycle.Status)
+	if requireResumable {
+		if !lifecycle.Paused && !wasTerminal {
+			return false, fmt.Errorf("仅已暂停或终态的任务可以继续")
+		}
+		if !wasTerminal {
+			mode = s.resumeAdmissionMode(t)
+		}
+	}
 	wasPaused := lifecycle.Paused || s.engine.IsPaused(t.ID)
 	wasQueued := lifecycle.Queued
 	engineWasPaused := s.engine.IsPaused(t.ID)
@@ -198,6 +196,10 @@ func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued
 		s.engine.Pause(t.ID, agent.Causef("queued_for_admission", "任务等待运行准入",
 			"任务正在等待并发队列或准入状态提交，本次执行已停止；只有获得运行槽后才会重新领取意图"))
 	}
+	if wasTerminal {
+		// 先停掉上一轮的协调器，再提交新状态，避免旧 deadline 抢先收掉续跑。
+		s.engine.stopDeadlineCoordinator(t.ID)
+	}
 
 	status := lifecycle.Status
 	// 首次准入（bootstrap）之前 tasks.status 一直停在 created，任务实际已跑数小时
@@ -207,10 +209,6 @@ func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued
 	}
 	if wasTerminal {
 		status = "running"
-		// 终态复活是一次新的探索：清掉旧收尾计数，避免第一轮就被 idle 判据收掉。
-		if err := s.m.pg.ResetTaskProgress(t.ID); err != nil {
-			log.Printf("[auto-finish] task %s 复活时重置进度失败: %v", t.ID, err)
-		}
 	}
 	if err := s.m.ApplyTaskAdmission(t.ID, lifecycle.Status, status, shouldQueue, mode, wasQueued); err != nil {
 		if !engineWasPaused && !wasPaused && !wasQueued {
@@ -218,11 +216,13 @@ func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued
 		}
 		return false, err
 	}
-	if lifecycle.Status == "timeout" && status == "running" {
-		// ApplyTaskAdmission reset this timed-out run's persisted clock. Clear the
-		// matching Engine gates before either parking it in FIFO or starting work;
-		// otherwise the old settling flag would make every worker skip forever.
-		s.engine.resetTimeoutRevival(t.ID)
+	if wasTerminal {
+		// 终态续跑使用新预算，持久化时钟已随准入一起清零。清理所有旧收尾门，
+		// 原 planner/worker 循环会在获准后继续，无需重建并行的调度循环。
+		s.engine.resetTerminalRevival(t)
+		if err := s.m.pg.DeleteTaskProgress(t.ID); err != nil {
+			log.Printf("[auto-finish] task %s 复活时重置本轮进度失败: %v", t.ID, err)
+		}
 	}
 	if shouldQueue {
 		if !wasQueued {
@@ -271,9 +271,8 @@ func (s *Server) startAdmittedTask(t *Task, mode string) {
 	}
 	s.engine.Run(s.ctx, t)
 	s.engine.Resume(t)
-	// Run returns early for an already-started task. Explicitly ensure a timeout
-	// coordinator exists after resume; resetTimeoutRevival cleared the completed
-	// coordinator's marker and the next real call will stamp a fresh deadline.
+	// Run 对已有循环只发唤醒；终态复活已停掉旧协调器，在这里确保新一轮协调器存在。
+	// 下一次真实 Planner/Worker 调用会盖章新的 deadline。
 	s.engine.startDeadlineCoordinator(s.ctx, t)
 }
 

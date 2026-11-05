@@ -1,7 +1,6 @@
 package db
 
 import (
-	"strconv"
 	"context"
 	"time"
 )
@@ -14,14 +13,17 @@ type TaskArtifact struct {
 	TaskID string `json:"task_id"`
 	// FindingID 可选：这张图/这个样本证明哪个漏洞（worker 报完漏洞后登记时带上）。
 	// 0 = 任务级材料（如目标首页截图），不进单个漏洞的详情页。
-	FindingID int64  `json:"finding_id,omitempty"`
-	Name      string `json:"name"` // 展示名（含扩展名）
-	Kind      string `json:"kind"` // image|data|log|html|other
-	Mime      string `json:"mime,omitempty"`
-	SizeBytes int64  `json:"size_bytes"`
-	SHA256    string `json:"sha256,omitempty"`
-	SourceURL string `json:"source_url,omitempty"`
-	Note      string `json:"note,omitempty"` // 报告图注/附件说明
+	FindingID int64 `json:"finding_id,omitempty"`
+	// 来源只在首次登记时写入；旧附件无法确认来源时保持零值。
+	IntentID   int64  `json:"intent_id,omitempty"`
+	SourcePath string `json:"source_path,omitempty"` // data 目录下原文件的相对路径
+	Name       string `json:"name"`                  // 展示名（含扩展名）
+	Kind       string `json:"kind"`                  // image|data|log|html|other
+	Mime       string `json:"mime,omitempty"`
+	SizeBytes  int64  `json:"size_bytes"`
+	SHA256     string `json:"sha256,omitempty"`
+	SourceURL  string `json:"source_url,omitempty"`
+	Note       string `json:"note,omitempty"` // 报告图注/附件说明
 	// 文档预览（v0.4.21）：Office/PDF 取样渲染成图片，sidecar 落盘不进附件限额。
 	// state: ""（非文档/未处理）| pending | ready | failed | skipped
 	PreviewState string    `json:"preview_state,omitempty"`
@@ -54,6 +56,9 @@ ALTER TABLE task_artifacts ADD COLUMN IF NOT EXISTS preview_state TEXT;
 ALTER TABLE task_artifacts ADD COLUMN IF NOT EXISTS preview_pages INT NOT NULL DEFAULT 0;
 ALTER TABLE task_artifacts ADD COLUMN IF NOT EXISTS preview_error TEXT;
 ALTER TABLE task_artifacts ADD COLUMN IF NOT EXISTS previewed_at TIMESTAMPTZ;
+ALTER TABLE task_artifacts ADD COLUMN IF NOT EXISTS intent_id BIGINT;
+ALTER TABLE task_artifacts ADD COLUMN IF NOT EXISTS source_path TEXT;
+CREATE INDEX IF NOT EXISTS idx_task_artifacts_unbound_intent ON task_artifacts(task_id,intent_id) WHERE finding_id IS NULL;
 `)
 	return err
 }
@@ -61,10 +66,10 @@ ALTER TABLE task_artifacts ADD COLUMN IF NOT EXISTS previewed_at TIMESTAMPTZ;
 // InsertTaskArtifact 登记一个附件（文件已由 host 落盘）。
 func (d *DB) InsertTaskArtifact(ctx context.Context, a *TaskArtifact) error {
 	return d.QueryRowContext(ctx, `
-INSERT INTO task_artifacts(task_id,finding_id,name,kind,mime,size_bytes,sha256,source_url,note,storage_path,preview_state)
-VALUES ($1,NULLIF($2,0),$3,$4,NULLIF($5,''),$6,NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10,NULLIF($11,''))
+INSERT INTO task_artifacts(task_id,finding_id,name,kind,mime,size_bytes,sha256,source_url,note,storage_path,preview_state,intent_id,source_path)
+VALUES ($1,NULLIF($2,0),$3,$4,NULLIF($5,''),$6,NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10,NULLIF($11,''),NULLIF($12,0),NULLIF($13,''))
 RETURNING id, created_at`,
-		a.TaskID, a.FindingID, a.Name, a.Kind, a.Mime, a.SizeBytes, a.SHA256, a.SourceURL, a.Note, a.Storage, a.PreviewState).
+		a.TaskID, a.FindingID, a.Name, a.Kind, a.Mime, a.SizeBytes, a.SHA256, a.SourceURL, a.Note, a.Storage, a.PreviewState, a.IntentID, a.SourcePath).
 		Scan(&a.ID, &a.CreatedAt)
 }
 
@@ -72,7 +77,7 @@ RETURNING id, created_at`,
 func (d *DB) ListTaskArtifacts(taskID string) ([]TaskArtifact, error) {
 	rows, err := d.Query(`
 SELECT id,task_id,COALESCE(finding_id,0),name,kind,COALESCE(mime,''),size_bytes,COALESCE(sha256,''),
-       COALESCE(source_url,''),COALESCE(note,''),COALESCE(preview_state,''),COALESCE(preview_pages,0),COALESCE(preview_error,''),storage_path,created_at
+       COALESCE(source_url,''),COALESCE(note,''),COALESCE(preview_state,''),COALESCE(preview_pages,0),COALESCE(preview_error,''),storage_path,created_at,COALESCE(intent_id,0),COALESCE(source_path,'')
 FROM task_artifacts WHERE task_id=$1 ORDER BY id`, taskID)
 	if err != nil {
 		return nil, err
@@ -82,7 +87,7 @@ FROM task_artifacts WHERE task_id=$1 ORDER BY id`, taskID)
 	for rows.Next() {
 		var a TaskArtifact
 		if err := rows.Scan(&a.ID, &a.TaskID, &a.FindingID, &a.Name, &a.Kind, &a.Mime, &a.SizeBytes,
-			&a.SHA256, &a.SourceURL, &a.Note, &a.PreviewState, &a.PreviewPages, &a.PreviewError, &a.Storage, &a.CreatedAt); err != nil {
+			&a.SHA256, &a.SourceURL, &a.Note, &a.PreviewState, &a.PreviewPages, &a.PreviewError, &a.Storage, &a.CreatedAt, &a.IntentID, &a.SourcePath); err != nil {
 			return nil, err
 		}
 		out = append(out, a)
@@ -95,10 +100,10 @@ func (d *DB) GetTaskArtifact(id int64) (*TaskArtifact, error) {
 	var a TaskArtifact
 	err := d.QueryRow(`
 SELECT id,task_id,COALESCE(finding_id,0),name,kind,COALESCE(mime,''),size_bytes,COALESCE(sha256,''),
-       COALESCE(source_url,''),COALESCE(note,''),COALESCE(preview_state,''),COALESCE(preview_pages,0),COALESCE(preview_error,''),storage_path,created_at
+       COALESCE(source_url,''),COALESCE(note,''),COALESCE(preview_state,''),COALESCE(preview_pages,0),COALESCE(preview_error,''),storage_path,created_at,COALESCE(intent_id,0),COALESCE(source_path,'')
 FROM task_artifacts WHERE id=$1`, id).
 		Scan(&a.ID, &a.TaskID, &a.FindingID, &a.Name, &a.Kind, &a.Mime, &a.SizeBytes,
-			&a.SHA256, &a.SourceURL, &a.Note, &a.PreviewState, &a.PreviewPages, &a.PreviewError, &a.Storage, &a.CreatedAt)
+			&a.SHA256, &a.SourceURL, &a.Note, &a.PreviewState, &a.PreviewPages, &a.PreviewError, &a.Storage, &a.CreatedAt, &a.IntentID, &a.SourcePath)
 	if err != nil {
 		return nil, err
 	}
@@ -119,9 +124,9 @@ func (d *DB) UpdateTaskArtifactFinding(id int64, findingID int64) (*TaskArtifact
 	err := d.QueryRow(`
 UPDATE task_artifacts SET finding_id=NULLIF($2,0) WHERE id=$1
 RETURNING id,task_id,COALESCE(finding_id,0),name,kind,COALESCE(mime,''),size_bytes,COALESCE(sha256,''),
-          COALESCE(source_url,''),COALESCE(note,''),COALESCE(preview_state,''),COALESCE(preview_pages,0),COALESCE(preview_error,''),storage_path,created_at`, id, findingID).
+          COALESCE(source_url,''),COALESCE(note,''),COALESCE(preview_state,''),COALESCE(preview_pages,0),COALESCE(preview_error,''),storage_path,created_at,COALESCE(intent_id,0),COALESCE(source_path,'')`, id, findingID).
 		Scan(&a.ID, &a.TaskID, &a.FindingID, &a.Name, &a.Kind, &a.Mime, &a.SizeBytes,
-			&a.SHA256, &a.SourceURL, &a.Note, &a.PreviewState, &a.PreviewPages, &a.PreviewError, &a.Storage, &a.CreatedAt)
+			&a.SHA256, &a.SourceURL, &a.Note, &a.PreviewState, &a.PreviewPages, &a.PreviewError, &a.Storage, &a.CreatedAt, &a.IntentID, &a.SourcePath)
 	if err != nil {
 		return nil, err
 	}
@@ -129,18 +134,18 @@ RETURNING id,task_id,COALESCE(finding_id,0),name,kind,COALESCE(mime,''),size_byt
 }
 
 // UpdateTaskArtifactBinding 补绑归属并补空字段（v0.4.20 去重路径用）：
-// 只有旧值为空时才写入 note/source_url，避免覆盖首次登记时的说明。
+// 只补空归属与 note/source_url，避免并发补绑覆盖首次归属或说明；来源不变。
 func (d *DB) UpdateTaskArtifactBinding(id int64, findingID int64, note, sourceURL string) (*TaskArtifact, error) {
 	var a TaskArtifact
 	err := d.QueryRow(`
-UPDATE task_artifacts SET finding_id=NULLIF($2,0),
+UPDATE task_artifacts SET finding_id=COALESCE(finding_id,NULLIF($2,0)),
        note=COALESCE(NULLIF(note,''),NULLIF($3,'')),
        source_url=COALESCE(NULLIF(source_url,''),NULLIF($4,''))
 WHERE id=$1
 RETURNING id,task_id,COALESCE(finding_id,0),name,kind,COALESCE(mime,''),size_bytes,COALESCE(sha256,''),
-          COALESCE(source_url,''),COALESCE(note,''),COALESCE(preview_state,''),COALESCE(preview_pages,0),COALESCE(preview_error,''),storage_path,created_at`, id, findingID, note, sourceURL).
+          COALESCE(source_url,''),COALESCE(note,''),COALESCE(preview_state,''),COALESCE(preview_pages,0),COALESCE(preview_error,''),storage_path,created_at,COALESCE(intent_id,0),COALESCE(source_path,'')`, id, findingID, note, sourceURL).
 		Scan(&a.ID, &a.TaskID, &a.FindingID, &a.Name, &a.Kind, &a.Mime, &a.SizeBytes,
-			&a.SHA256, &a.SourceURL, &a.Note, &a.PreviewState, &a.PreviewPages, &a.PreviewError, &a.Storage, &a.CreatedAt)
+			&a.SHA256, &a.SourceURL, &a.Note, &a.PreviewState, &a.PreviewPages, &a.PreviewError, &a.Storage, &a.CreatedAt, &a.IntentID, &a.SourcePath)
 	if err != nil {
 		return nil, err
 	}
@@ -151,7 +156,7 @@ RETURNING id,task_id,COALESCE(finding_id,0),name,kind,COALESCE(mime,''),size_byt
 func (d *DB) ListPendingPreviewArtifacts() ([]TaskArtifact, error) {
 	rows, err := d.Query(`
 SELECT id,task_id,COALESCE(finding_id,0),name,kind,COALESCE(mime,''),size_bytes,COALESCE(sha256,''),
-       COALESCE(source_url,''),COALESCE(note,''),COALESCE(preview_state,''),COALESCE(preview_pages,0),COALESCE(preview_error,''),storage_path,created_at
+       COALESCE(source_url,''),COALESCE(note,''),COALESCE(preview_state,''),COALESCE(preview_pages,0),COALESCE(preview_error,''),storage_path,created_at,COALESCE(intent_id,0),COALESCE(source_path,'')
 FROM task_artifacts WHERE preview_state='pending' ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -161,7 +166,7 @@ FROM task_artifacts WHERE preview_state='pending' ORDER BY id`)
 	for rows.Next() {
 		var a TaskArtifact
 		if err := rows.Scan(&a.ID, &a.TaskID, &a.FindingID, &a.Name, &a.Kind, &a.Mime, &a.SizeBytes,
-			&a.SHA256, &a.SourceURL, &a.Note, &a.PreviewState, &a.PreviewPages, &a.PreviewError, &a.Storage, &a.CreatedAt); err != nil {
+			&a.SHA256, &a.SourceURL, &a.Note, &a.PreviewState, &a.PreviewPages, &a.PreviewError, &a.Storage, &a.CreatedAt, &a.IntentID, &a.SourcePath); err != nil {
 			return nil, err
 		}
 		out = append(out, a)
@@ -196,21 +201,20 @@ func (d *DB) ListArtifactTaskIDs() ([]string, error) {
 	return out, rows.Err()
 }
 
-// RetroBindIntentEvidence 把指定意图运行目录下的全部未归属证据一次性绑定到漏洞。
-// 触发时机：report_finding 落库后——worker 在意图执行中先存证据、后报漏洞，
-// 此时所有该意图下已保存但 finding_id 为空的证据都属于这个漏洞。
-// 返回实际绑定的数量。调用方（report_finding）不需要额外确认——同意图目录是
-// 天然的 provenance 边界，不会误绑其他意图的证据。
+// RetroBindIntentEvidence 按首次登记时确认的意图来源补绑未归属附件。
+// 保留同意图的 first-unbound 行为；旧附件来源未知时不根据存储路径或文件名猜测。
 func (d *DB) RetroBindIntentEvidence(taskID string, intentID int64, findingID int64) (int, error) {
-	pattern := "%/i" + strconv.FormatInt(intentID, 10) + "/%"
+	if intentID <= 0 || findingID <= 0 {
+		return 0, nil
+	}
 	res, err := d.Exec(`
 UPDATE task_artifacts
 SET finding_id=$3
-WHERE task_id=$1 AND finding_id IS NULL AND storage_path LIKE $2`,
-		taskID, pattern, findingID)
+WHERE task_id=$1 AND finding_id IS NULL AND intent_id=$2`,
+		taskID, intentID, findingID)
 	if err != nil {
 		return 0, err
 	}
-	n, _ := res.RowsAffected()
-	return int(n), nil
+	n, err := res.RowsAffected()
+	return int(n), err
 }

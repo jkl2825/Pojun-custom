@@ -108,8 +108,33 @@ func (s *Server) taskArtifactsDir(taskID string) string {
 	return filepath.Join(s.m.dir, "tasks", taskID, "artifacts")
 }
 
+// artifactSource 从真实源路径保留来源，只认任务根第一层规范的 i<ID> 目录。
+func (s *Server) artifactSource(abs, taskKey string) (resolved string, intentID int64, sourcePath string, err error) {
+	taskRoot, err := filepath.EvalSymlinks(filepath.Join(s.m.dir, "tasks", taskKey))
+	if err != nil {
+		return "", 0, "", fmt.Errorf("解析任务目录失败：%w", err)
+	}
+	resolved, err = filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", 0, "", fmt.Errorf("解析源文件失败：%w", err)
+	}
+	rel, err := filepath.Rel(taskRoot, resolved)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return "", 0, "", fmt.Errorf("path 超出任务目录范围")
+	}
+	sourcePath = filepath.ToSlash(filepath.Join("tasks", taskKey, rel))
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	if len(parts) > 1 && strings.HasPrefix(parts[0], "i") {
+		id, parseErr := strconv.ParseInt(strings.TrimPrefix(parts[0], "i"), 10, 64)
+		if parseErr == nil && id > 0 && parts[0] == "i"+strconv.FormatInt(id, 10) {
+			intentID = id
+		}
+	}
+	return resolved, intentID, sourcePath, nil
+}
+
 // RecordArtifact 把任务工作目录里的一个文件登记为证据附件：校验路径边界与
-// 限额 → 计算 sha256（同任务同内容去重）→ 复制到任务附件目录 → 落库。
+// 限额 → 计算 sha256（同任务同意图同内容去重）→ 复制到任务附件目录 → 落库。
 // relPath 相对 runDir（worker 的工作目录）；必须落在 tasks/<taskID>/ 之内。
 func (s *Server) RecordArtifact(taskID, findingID int64, runDir, relPath, name, kind, sourceURL, note string) (*db.TaskArtifact, error) {
 	pg := s.m.PG()
@@ -485,11 +510,15 @@ func artifactListJSON(list []db.TaskArtifact) []map[string]any {
 	return out
 }
 
-// recordArtifactAbs 以绝对路径登记附件（调用方已完成路径边界校验）。
+// recordArtifactAbs 以绝对路径登记附件，并从校验后的真实路径保留来源。
 func (s *Server) recordArtifactAbs(abs, taskKey string, findingID int64, name, kind, sourceURL, note string, size int64) (*db.TaskArtifact, error) {
 	pg := s.m.PG()
 	if pg == nil {
 		return nil, fmt.Errorf("PG 不可用")
+	}
+	abs, intentID, sourcePath, err := s.artifactSource(abs, taskKey)
+	if err != nil {
+		return nil, err
 	}
 	data, err := os.ReadFile(abs)
 	if err != nil {
@@ -498,13 +527,13 @@ func (s *Server) recordArtifactAbs(abs, taskKey string, findingID int64, name, k
 	sum := sha256.Sum256(data)
 	sha := hex.EncodeToString(sum[:])
 
-	// 去重：同任务同内容直接返回已有登记，不重复落盘。
+	// 同意图同内容复用首次登记；跨意图或历史来源未知的附件不合并，保留独立来源。
 	// v0.4.20：截图常发生在 report_finding 之前（拿不到 finding_id），事后补登记
 	// 同一文件时不能因为去重把归属丢掉——旧记录还是任务级就补绑；已归属其他
 	// 漏洞的不抢占（避免把 A 漏洞的证据挪给 B）。
 	if list, err := pg.ListTaskArtifacts(taskKey); err == nil {
 		for i := range list {
-			if list[i].SHA256 == sha && list[i].SizeBytes == size {
+			if list[i].SHA256 == sha && list[i].SizeBytes == size && list[i].IntentID == intentID {
 				existing := &list[i]
 				if findingID > 0 && existing.FindingID == 0 {
 					if updated, uerr := pg.UpdateTaskArtifactBinding(existing.ID, findingID, note, sourceURL); uerr == nil {
@@ -538,7 +567,8 @@ func (s *Server) recordArtifactAbs(abs, taskKey string, findingID int64, name, k
 		return nil, fmt.Errorf("写入附件失败：%w", err)
 	}
 	a := &db.TaskArtifact{
-		TaskID: taskKey, FindingID: findingID, Name: name, Kind: kind, Mime: autoMime,
+		TaskID: taskKey, FindingID: findingID, IntentID: intentID, SourcePath: sourcePath,
+		Name: name, Kind: kind, Mime: autoMime,
 		SizeBytes: int64(len(data)), SHA256: sha, SourceURL: sourceURL,
 		Note: note, Storage: storage,
 	}
@@ -564,10 +594,14 @@ func (s *Server) scanTaskArtifactDir(taskID string) (added, skipped, truncated i
 	}
 	root := filepath.Join(s.m.dir, "tasks", taskID)
 	artifactsDir := s.taskArtifactsDir(taskID)
-	existing := map[string]bool{}
+	type sourceHash struct {
+		intentID int64
+		sha256   string
+	}
+	existing := map[sourceHash]bool{}
 	if list, e := pg.ListTaskArtifacts(taskID); e == nil {
 		for _, a := range list {
-			existing[a.SHA256] = true
+			existing[sourceHash{a.IntentID, a.SHA256}] = true
 		}
 	}
 	const limit = 60
@@ -613,7 +647,12 @@ func (s *Server) scanTaskArtifactDir(taskID string) (added, skipped, truncated i
 		}
 		f.Close()
 		sum := hex.EncodeToString(h.Sum(nil))
-		if existing[sum] {
+		_, intentID, _, e := s.artifactSource(path, taskID)
+		if e != nil {
+			return nil
+		}
+		key := sourceHash{intentID, sum}
+		if existing[key] {
 			skipped++
 			return nil
 		}
@@ -627,7 +666,7 @@ func (s *Server) scanTaskArtifactDir(taskID string) (added, skipped, truncated i
 		if e != nil {
 			return nil
 		}
-		existing[sum] = true
+		existing[key] = true
 		added++
 		return nil
 	})

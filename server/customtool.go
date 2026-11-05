@@ -14,12 +14,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
-	"github.com/chu0119/pojun/db"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
+	"github.com/chu0119/pojun/db"
 )
 
 // 本文件实现自定义工具执行器(docs/自定义工具设计.md)。system=false 的 tools 行按
@@ -65,6 +66,10 @@ func (s *Server) pgCreateCustomTool(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "http 工具必须提供参数 JSON Schema(不能留空)")
 		return
 	}
+	if err := lintCustomToolExec(req.Kind, req.Exec); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	if exist, _ := pg.GetTool(req.Key); exist != nil {
 		writeErr(w, 409, "该 key 已存在(内置或自定义工具)")
 		return
@@ -105,6 +110,10 @@ func (s *Server) pgUpdateCustomTool(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Kind == "http" && !hasSchemaProps(req.Schema) {
 		writeErr(w, 400, "http 工具必须提供参数 JSON Schema(不能留空)")
+		return
+	}
+	if err := lintCustomToolExec(req.Kind, req.Exec); err != nil {
+		writeErr(w, 400, err.Error())
 		return
 	}
 	if err := pg.UpdateCustomTool(&db.Tool{
@@ -163,6 +172,10 @@ func (s *Server) pgTestCustomTool(w http.ResponseWriter, r *http.Request) {
 	var res actool.Result
 	switch req.Kind {
 	case "command":
+		if err := lintCustomToolExec(req.Kind, req.Exec); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
 		res, _ = s.runCommandTool(ctx, req.Exec, params, tc)
 	case "script":
 		res, _ = s.runScriptTool(ctx, "test", req.Exec, params, tc)
@@ -334,6 +347,9 @@ func (s *Server) runCommandTool(ctx context.Context, execRaw json.RawMessage, pa
 	if strings.TrimSpace(spec.Command) == "" {
 		return actool.Errorf("command 为空"), nil
 	}
+	if err := lintCommandTemplate(spec.Command); err != nil {
+		return actool.Errorf(err.Error()), nil
+	}
 	cmd := renderTemplate(spec.Command, params, shellQuote)
 	// 复用 Bash 也在用的底层 run(经 Bash CoreTool.Call):自动继承安全 floor/超时/
 	// 代理 env/输出溢出。工具与 Bash 平级、共用底层,不经过 Bash 这个工具让模型调。
@@ -424,7 +440,10 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 	if method == "" {
 		method = "GET"
 	}
-	rawURL := renderTemplate(spec.URL, params, identity)
+	// URL 按占位符位置编码:query 部分用 QueryEscape、path 部分用 PathEscape,
+	// 阻止参数值注入 '?'、'&'、'/'、CR/LF 等 URL 结构字符。body/header 保持原样
+	// (header 的 CRLF 由 net/http 自身拒绝)。
+	rawURL := renderTemplate(spec.URL, params, urlQuote)
 	if strings.TrimSpace(rawURL) == "" {
 		return actool.Errorf("http url 为空"), nil
 	}
@@ -488,18 +507,149 @@ func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
 
 // ---------- helpers ----------
 
-func identity(s string) string { return s }
+// rePlaceholder matches a {name} template placeholder (word characters only).
+// Package-level so it is compiled exactly once.
+var rePlaceholder = regexp.MustCompile(`\{([A-Za-z0-9_]+)\}`)
+
+// identity is the no-op quote: raw substitution (http body/header). Header
+// CRLF is already rejected by net/http itself.
+func identity(s string, _ string, _ int) string { return s }
 
 // shellQuote single-quotes a value for safe shell interpolation.
-func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+func shellQuote(s string, _ string, _ int) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
 
-// renderTemplate replaces {name} placeholders with each param's rendered value.
-func renderTemplate(tmpl string, params map[string]any, quote func(string) string) string {
-	out := tmpl
-	for k, v := range params {
-		out = strings.ReplaceAll(out, "{"+k+"}", quote(valToStr(v)))
+// urlQuote percent-encodes a value by its placeholder's position in the URL
+// template: when a '?' or '&' precedes the placeholder (query part) it uses
+// QueryEscape, otherwise (path part) PathEscape. Positional escaping stops
+// parameter values from smuggling '?', '&', '/', CR/LF or spaces into the URL.
+func urlQuote(value, tmpl string, pos int) string {
+	if strings.LastIndexAny(tmpl[:pos], "?&") >= 0 {
+		return url.QueryEscape(value)
 	}
-	return out
+	return url.PathEscape(value)
+}
+
+// renderTemplate replaces {name} placeholders with param values in a single
+// left-to-right pass. Single-pass makes the result deterministic (no map
+// iteration order dependence) and immune to cross-param pollution: values are
+// inserted verbatim and never rescanned for further placeholders. Keys absent
+// from params are kept verbatim. quote receives the rendered value plus the
+// template and the placeholder's start offset, so it can encode by position
+// (see urlQuote).
+func renderTemplate(tmpl string, params map[string]any, quote func(value, tmpl string, pos int) string) string {
+	var b strings.Builder
+	last := 0
+	for _, m := range rePlaceholder.FindAllStringSubmatchIndex(tmpl, -1) {
+		start, end, kStart, kEnd := m[0], m[1], m[2], m[3]
+		b.WriteString(tmpl[last:start])
+		if v, ok := params[tmpl[kStart:kEnd]]; ok {
+			b.WriteString(quote(valToStr(v), tmpl, start))
+		} else {
+			b.WriteString(tmpl[start:end]) // params 里没有的 key 原样保留
+		}
+		last = end
+	}
+	b.WriteString(tmpl[last:])
+	return b.String()
+}
+
+// lintCommandTemplate 只允许占位符作为未引用、未转义的独立 shell word。
+// 外层引号会使 shellQuote 的单引号失效；复杂展开及 here-document 不在此处
+// 局部解析，含占位符时保守拒绝，避免嵌套语境被误判为普通参数。
+func lintCommandTemplate(cmd string) error {
+	matches := rePlaceholder.FindAllStringIndex(cmd, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	var quote byte
+	escaped, comment, inWord := false, false, false
+	placeholder := 0
+	for i := 0; i < len(cmd); i++ {
+		if placeholder < len(matches) && i == matches[placeholder][0] {
+			m := matches[placeholder]
+			next := m[1]
+			for next+1 < len(cmd) && cmd[next] == '\\' && cmd[next+1] == '\n' {
+				next += 2
+			}
+			if quote != 0 || escaped || comment || inWord ||
+				(next < len(cmd) && !strings.ContainsRune(" \t\n;&|<>", rune(cmd[next]))) {
+				return fmt.Errorf("command 模板中占位符 %s 必须位于未引用、未转义的参数位置：占位符必须独立成词，不要用引号包裹（写 curl {url}，系统会自动安全转义）", cmd[m[0]:m[1]])
+			}
+			inWord = true
+			i = m[1] - 1
+			placeholder++
+			continue
+		}
+		c := cmd[i]
+		if comment {
+			if c == '\n' {
+				comment, inWord = false, false
+			}
+			continue
+		}
+		if escaped {
+			escaped = false
+			if c != '\n' {
+				inWord = true
+			}
+			continue
+		}
+		if quote == '\'' {
+			if c == '\'' {
+				quote = 0
+			}
+			continue
+		}
+		next := i + 1
+		for next+1 < len(cmd) && cmd[next] == '\\' && cmd[next+1] == '\n' {
+			next += 2
+		}
+		if c == '`' || (c == '$' && next < len(cmd) && strings.ContainsRune("({['\"", rune(cmd[next]))) ||
+			(quote == 0 && (c == '(' || c == ')' || (c == '<' && next < len(cmd) && cmd[next] == '<'))) {
+			return fmt.Errorf("command 模板含占位符时不支持复杂 shell 展开、反引号、括号或 here-document，请改用 script 工具")
+		}
+		if quote == '"' {
+			if c == '"' {
+				quote = 0
+			} else if c == '\\' {
+				escaped = true
+			}
+			continue
+		}
+		switch c {
+		case '\\':
+			escaped = true
+		case '\'', '"':
+			quote, inWord = c, true
+		case '#':
+			if !inWord {
+				comment = true
+			}
+		case ' ', '\t', '\n', ';', '&', '|', '<', '>':
+			inWord = false
+		default:
+			inWord = true
+		}
+	}
+	if quote != 0 || escaped {
+		return fmt.Errorf("command 模板包含未闭合引号或未完成的转义")
+	}
+	return nil
+}
+
+// lintCustomToolExec 在保存和编辑器测试时校验 command 模板；运行前还会复验。
+// 非 command 类型不校验，格式错误的 exec 仍由执行器处理。
+func lintCustomToolExec(kind string, execRaw json.RawMessage) error {
+	if kind != "command" || len(execRaw) == 0 {
+		return nil
+	}
+	var spec commandExec
+	if json.Unmarshal(execRaw, &spec) != nil {
+		return nil
+	}
+	return lintCommandTemplate(spec.Command)
 }
 
 // valToStr renders a param value: scalars as-is, arrays/objects as compact JSON.

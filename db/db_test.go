@@ -4,6 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -53,13 +57,39 @@ func TestApplySchemaRetriesOnlyDeadlocks(t *testing.T) {
 
 // testDSN returns the configured DSN, skipping the test when neither the env var
 // nor a config file supplies one (DSN no longer has a built-in default).
+//
+// ## 生产库守护（2026-11-05 加的）
+//
+// db 包的部分用例会**真的创建 task / llm_profile / exploration**，只在结尾删自己
+// 造的那几条，不会回滚整个事务。2026-11-05 一次全量 `go test ./db/` 直连生产库，
+// 留下 34 个状态为 running 的假任务和 12 个测试 profile（其中一个还抢了
+// is_default），导致引擎起来后去跑这些不存在的任务、LLM 通道一度不可用。
+//
+// 所以这里加硬闸：DSN 的库名不是 `pojun_test` 就跳过（除非显式
+// POJUN_TEST_ALLOW_PROD=1）。想跑全量测试就建一个独立库：
+//
+//	createdb pojun_test    # 或用同一个 postgres 实例：
+//	psql -c 'CREATE DATABASE pojun_test'
+//	POJUN_PG_DSN='postgres://user:pass@host:5432/pojun_test?sslmode=disable' go test ./db/
 func testDSN(t *testing.T) string {
 	t.Helper()
 	dsn, _, err := DSN()
 	if err != nil {
 		t.Skipf("no database config (%v) — skipping", err)
 	}
+	if os.Getenv("POJUN_TEST_ALLOW_PROD") != "1" && !IsTestDatabase(dsn) {
+		t.Skipf("refusing to run against non-test database (set POJUN_TEST_ALLOW_PROD=1 to override): %s", redactDSN(dsn))
+	}
 	return dsn
+}
+
+// redactDSN 隐去密码，只保留 host/db，便于在 skip 信息里定位。
+func redactDSN(dsn string) string {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "(unparsable dsn)"
+	}
+	return fmt.Sprintf("%s/%s", u.Host, strings.TrimPrefix(u.Path, "/"))
 }
 
 // TestOpenSeed opens the live dev PG, applies schema, seeds, and verifies the

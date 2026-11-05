@@ -412,7 +412,7 @@ func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, pre
 			ORDER BY id LIMIT 1 FOR UPDATE`, in.TaskID, fp).Scan(&dupeID, &dupeNode, &dupeStatus)
 		if err == nil {
 			stamp := time.Now().UTC().Format("2006-01-02 15:04")
-			appendix := fmt.Sprintf("\n\n--- 二次确认(worker=%s, %s UTC) ---\n%s", in.Worker, stamp, in.Evidence)
+			appendix := utf8Clean(fmt.Sprintf("\n\n--- 二次确认(worker=%s, %s UTC) ---\n%s", in.Worker, stamp, in.Evidence))
 			if _, err := tx.Exec(`UPDATE findings SET evidence = evidence || $2, severity = $3 WHERE id=$1`,
 				dupeID, appendix, in.Severity); err != nil {
 				return nil, err
@@ -436,10 +436,13 @@ func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, pre
 			return out, err
 		}
 	}
-	payload, _ := json.Marshal(map[string]any{"vulnclass": in.VulnClass, "name": in.Name, "severity": in.Severity, "summary": in.Summary, "evidence": map[string]any{"by": in.Worker, "poc": in.Evidence}})
+	payloadJSON, err := jsonArg(map[string]any{"vulnclass": in.VulnClass, "name": in.Name, "severity": in.Severity, "summary": in.Summary, "evidence": map[string]any{"by": in.Worker, "poc": in.Evidence}})
+	if err != nil {
+		return nil, err
+	}
 	out := &RecordedFinding{}
 	if err := tx.QueryRow(`INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
-VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string(payload), in.Worker).Scan(&out.NodeID); err != nil {
+VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, payloadJSON, in.Worker).Scan(&out.NodeID); err != nil {
 		return nil, err
 	}
 	for _, asset := range in.AssetIDs {
@@ -458,7 +461,7 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 	}
 	raw, _ := json.Marshal(assets)
 	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids,fingerprint)
-VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw), fp).Scan(&out.FindingID); err != nil {
+VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, utf8Clean(in.Name), in.Severity, utf8Clean(in.Summary), utf8Clean(in.Evidence), in.Worker, string(raw), fp).Scan(&out.FindingID); err != nil {
 		return nil, err
 	}
 	// 在**同一事务**里登记一条推送事件：提交即保证「漏洞落库」与「推送任务存在」
@@ -477,7 +480,6 @@ VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`, in.TaskID, out.N
 	if err := AddFindingTrafficTx(tx, out.FindingID, prepared); err != nil {
 		return nil, err
 	}
-	var err error
 	out.Traffic, err = FindingTrafficTx(tx, out.FindingID)
 	return out, err
 }

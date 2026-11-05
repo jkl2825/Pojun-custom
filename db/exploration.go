@@ -2,6 +2,7 @@ package db
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -61,6 +62,18 @@ func jsonbClean(b []byte) []byte {
 		out = append(out, b[i])
 	}
 	return out
+}
+
+// jsonArg marshals v and returns it as a jsonb-safe string argument: json.Marshal
+// followed by jsonbClean. It is the boundary every jsonb write should pass through
+// so captured evidence bytes (pcaps, raw tool output) carrying NUL cannot abort the
+// whole INSERT/UPDATE (SQLSTATE 22P05).
+func jsonArg(v any) (string, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	return string(jsonbClean(raw)), nil
 }
 
 // Node is a typed reasoning node (= old task_nodes). kind ∈ goal|intent|finding|hint.
@@ -206,33 +219,60 @@ func (s *ExplorationStore) Root() (description, goal string, err error) {
 // An anchor is a provenance edge, not the payload. Losing a dangling edge is
 // correct; losing the node is not.
 func (s *ExplorationStore) AddNode(kind string, payload map[string]any, priority int, state, origin string, anchors []int64) (int64, error) {
-	raw, _ := json.Marshal(payload)
+	payloadJSON, err := jsonArg(payload)
+	if err != nil {
+		return 0, err
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
+	if kind == KindIntent {
+		if err := s.lockIntentAdmissionTx(tx); err != nil {
+			return 0, err
+		}
+	}
+	id, err := s.insertNodeTx(tx, kind, payloadJSON, priority, state, origin, anchors)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// 所有意图创建路径先取同一探索锁，再读取队列或写入节点。
+func (s *ExplorationStore) lockIntentAdmissionTx(tx *sql.Tx) error {
+	var id int64
+	return tx.QueryRow(`SELECT id FROM explorations WHERE id=$1 FOR UPDATE`, s.expID).Scan(&id)
+}
+
+func (s *ExplorationStore) insertNodeTx(tx *sql.Tx, kind, payloadJSON string, priority int, state, origin string, anchors []int64) (int64, error) {
 	var id int64
 	if err := tx.QueryRow(`
 INSERT INTO exploration_nodes(exploration_id, kind, payload, priority, state, origin)
 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-		s.expID, kind, string(raw), priority, state, origin).Scan(&id); err != nil {
+		s.expID, kind, payloadJSON, priority, state, origin).Scan(&id); err != nil {
 		return 0, err
 	}
-	for _, a := range s.existingAssetIDs(tx, anchors) {
+	existing, err := s.existingAssetIDs(tx, anchors)
+	if err != nil {
+		return 0, err
+	}
+	for _, a := range existing {
 		if _, err := tx.Exec(`INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, id, a); err != nil {
 			return 0, err
 		}
 	}
-	return id, tx.Commit()
+	return id, nil
 }
 
-// existingAssetIDs filters the requested anchor ids down to the ones that
-// actually exist in `assets`. Unknown ids are dropped (the FK would reject
-// them); duplicates are collapsed so the same asset is not anchored twice.
-func (s *ExplorationStore) existingAssetIDs(tx *sql.Tx, ids []int64) []int64 {
+// existingAssetIDs 过滤不存在的资产并去重；数据库读取失败不能伪装成空锚点。
+func (s *ExplorationStore) existingAssetIDs(tx *sql.Tx, ids []int64) ([]int64, error) {
 	if len(ids) == 0 {
-		return nil
+		return nil, nil
 	}
 	uniq := make([]int64, 0, len(ids))
 	seen := make(map[int64]bool, len(ids))
@@ -244,7 +284,7 @@ func (s *ExplorationStore) existingAssetIDs(tx *sql.Tx, ids []int64) []int64 {
 		uniq = append(uniq, id)
 	}
 	if len(uniq) == 0 {
-		return nil
+		return nil, nil
 	}
 	placeholders := make([]string, len(uniq))
 	args := make([]any, len(uniq))
@@ -252,21 +292,20 @@ func (s *ExplorationStore) existingAssetIDs(tx *sql.Tx, ids []int64) []int64 {
 		placeholders[i] = fmt.Sprintf("$%d", i+1)
 		args[i] = id
 	}
-	rows, err := tx.Query(`SELECT id FROM assets WHERE id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	rows, err := tx.Query(`SELECT id FROM assets WHERE id IN (`+strings.Join(placeholders, ",")+`) FOR KEY SHARE`, args...)
 	if err != nil {
-		// 校验失败不能挡住节点写入——退化成「全部锚点都跳过」。
-		return nil
+		return nil, err
 	}
 	defer rows.Close()
 	var out []int64
 	for rows.Next() {
 		var id int64
 		if err := rows.Scan(&id); err != nil {
-			return out
+			return nil, err
 		}
 		out = append(out, id)
 	}
-	return out
+	return out, rows.Err()
 }
 
 // AddIntent is a convenience: an open intent.
@@ -275,6 +314,155 @@ func (s *ExplorationStore) AddIntent(payload map[string]any, priority int, ancho
 		origin = "planner"
 	}
 	return s.AddNode("intent", payload, priority, "open", origin, anchors)
+}
+
+// IntentAdmission 是单条意图在同一事务内检查的准入条件。
+type IntentAdmission struct {
+	MaxOpen          int
+	Autonomous       bool
+	DeadlineUnix     int64
+	CollaboratesWith int64
+	ParentIDs        []int64
+}
+
+// AddIntentAdmitted 原子完成准入、判重、节点/锚点及父链写入。
+// 普通 AddIntent 保留人工和旧入口的无上限行为，但参与同一探索锁。
+func (s *ExplorationStore) AddIntentAdmitted(payload map[string]any, priority int, anchors []int64, origin string, admission IntentAdmission) (int64, error) {
+	return s.AddIntentAdmittedContext(context.Background(), payload, priority, anchors, origin, admission)
+}
+
+// AddIntentAdmittedContext binds all writes to this planning run's lifetime.
+// BeginTx rolls back on cancellation, including cancellation while waiting for
+// the exploration lock. A timed-out planner cannot commit a late proposal.
+func (s *ExplorationStore) AddIntentAdmittedContext(ctx context.Context, payload map[string]any, priority int, anchors []int64, origin string, admission IntentAdmission) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if origin == "" {
+		origin = "planner"
+	}
+	if admission.CollaboratesWith < 0 || (admission.CollaboratesWith > 0 && !admission.Autonomous) {
+		return 0, fmt.Errorf("collaboration_rejected: 协作必须由自主派单创建并指定有效源意图")
+	}
+	if admission.Autonomous && admission.CollaboratesWith == 0 && admission.MaxOpen <= 0 {
+		return 0, fmt.Errorf("queue_backpressure: 自主派单的 MaxOpen 必须大于零")
+	}
+	if _, exists := payload["collaborates_with"]; exists && admission.CollaboratesWith == 0 {
+		return 0, fmt.Errorf("collaboration_rejected: 协作元数据与准入源意图不一致")
+	}
+	admittedPayload := make(map[string]any, len(payload)+2)
+	for key, value := range payload {
+		admittedPayload[key] = value
+	}
+	payloadJSON, err := jsonArg(admittedPayload)
+	if err != nil {
+		return 0, err
+	}
+	var fields intentAdmissionPayload
+	if err := json.Unmarshal([]byte(payloadJSON), &fields); err != nil {
+		return 0, fmt.Errorf("intent_admission: 无效意图元数据: %w", err)
+	}
+	if strings.TrimSpace(fields.Summary) == "" {
+		return 0, fmt.Errorf("intent_admission: summary 不能为空")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var lockedExploration int64
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM explorations WHERE id=$1 FOR UPDATE`, s.expID).Scan(&lockedExploration); err != nil {
+		return 0, err
+	}
+	if admission.Autonomous {
+		var storedDeadline sql.NullTime
+		err := tx.QueryRow(`SELECT deadline_at FROM tasks WHERE exploration_id=$1`, s.expID).Scan(&storedDeadline)
+		if err != nil && err != sql.ErrNoRows {
+			return 0, fmt.Errorf("intent_admission: 读取任务截止时间: %w", err)
+		}
+		deadline := time.Time{}
+		if storedDeadline.Valid {
+			deadline = storedDeadline.Time
+		}
+		if admission.DeadlineUnix != 0 {
+			requested := time.Unix(admission.DeadlineUnix, 0)
+			if deadline.IsZero() || requested.Before(deadline) {
+				deadline = requested
+			}
+		}
+		minimum := 2 * time.Minute
+		if admission.CollaboratesWith > 0 {
+			minimum = 5 * time.Minute
+		}
+		if !deadline.IsZero() && time.Until(deadline) < minimum {
+			return 0, fmt.Errorf("deadline_backpressure: 剩余时间不足 %s，不再新增方向", minimum)
+		}
+	}
+	if existing, summary, found, err := findSimilarOpenIntent(tx, s.expID, fields.Summary); err != nil {
+		return 0, fmt.Errorf("intent_admission: 读取判重记录: %w", err)
+	} else if found {
+		return 0, fmt.Errorf("duplicate_intent: 与已有意图 #%d「%s」重复", existing, summary)
+	}
+	if admission.CollaboratesWith > 0 {
+		if err := s.admitCollaborationTx(tx, admittedPayload, fields, anchors, admission); err != nil {
+			return 0, err
+		}
+		payloadJSON, err = jsonArg(admittedPayload)
+		if err != nil {
+			return 0, err
+		}
+	} else if admission.Autonomous {
+		var open int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='intent' AND state='open'
+  AND NOT (payload ? 'collaborates_with')`, s.expID).Scan(&open); err != nil {
+			return 0, fmt.Errorf("intent_admission: 读取待领队列: %w", err)
+		}
+		if open >= admission.MaxOpen {
+			return 0, fmt.Errorf("queue_backpressure: 普通待领意图 %d 已达到上限 %d", open, admission.MaxOpen)
+		}
+	}
+	id, err := s.insertNodeTx(tx, KindIntent, payloadJSON, priority, "open", origin, anchors)
+	if err != nil {
+		return 0, err
+	}
+	parents := append([]int64(nil), admission.ParentIDs...)
+	if len(parents) == 0 {
+		var root int64
+		err := tx.QueryRow(`SELECT id FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='fact' AND state='origin' ORDER BY id LIMIT 1`, s.expID).Scan(&root)
+		if err != nil && err != sql.ErrNoRows {
+			return 0, err
+		}
+		if root > 0 {
+			parents = append(parents, root)
+		}
+	}
+	if admission.CollaboratesWith > 0 {
+		parents = append(parents, admission.CollaboratesWith)
+	}
+	for _, parent := range parents {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_edges(exploration_id, src_id, rel, dst_id)
+VALUES ($1,$2,$3,$4) ON CONFLICT (exploration_id, src_id, rel, dst_id) DO NOTHING`, s.expID, parent, RelDerivedFrom, id); err != nil {
+			return 0, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// IntentAdmissionStats 返回完整计数，不使用 Frontier 等分页视图。
+func (s *ExplorationStore) IntentAdmissionStats() (open, running, collaborating int, err error) {
+	err = s.db.QueryRow(`SELECT COUNT(*) FILTER (WHERE state='open'),
+       COUNT(*) FILTER (WHERE state='running'),
+       COUNT(*) FILTER (WHERE state IN ('open','running','paused') AND payload ? 'collaborates_with')
+FROM exploration_nodes WHERE exploration_id=$1 AND kind='intent'`, s.expID).Scan(&open, &running, &collaborating)
+	return
 }
 
 // AddGoal writes a goal node (state open).
@@ -330,13 +518,16 @@ func (s *ExplorationStore) SetNodeState(id int64, state string) error {
 // payload 的合并字段里，报告与界面才能如实呈现，而不是让一次偷懒的收官看起来
 // 和验证过的达成一样。
 func (s *ExplorationStore) MarkGoalUnverified(id int64, reason string) error {
-	raw, _ := json.Marshal(map[string]any{
+	payloadJSON, err := jsonArg(map[string]any{
 		"unverified":        true,
 		"unverified_reason": reason,
 	})
-	_, err := s.db.Exec(`UPDATE exploration_nodes
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE exploration_nodes
 SET payload = COALESCE(payload,'{}'::jsonb) || $1::jsonb
-WHERE id=$2 AND exploration_id=$3 AND kind='goal'`, string(raw), id, s.expID)
+WHERE id=$2 AND exploration_id=$3 AND kind='goal'`, payloadJSON, id, s.expID)
 	return err
 }
 
@@ -347,10 +538,13 @@ func (s *ExplorationStore) MergeIntentPayload(id int64, fields map[string]any) e
 	if len(fields) == 0 {
 		return nil
 	}
-	raw, _ := json.Marshal(fields)
-	_, err := s.db.Exec(`UPDATE exploration_nodes
+	payloadJSON, err := jsonArg(fields)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE exploration_nodes
 SET payload = COALESCE(payload,'{}'::jsonb) || $1::jsonb
-WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, string(raw), id, s.expID)
+WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, payloadJSON, id, s.expID)
 	return err
 }
 
@@ -362,8 +556,11 @@ func (s *ExplorationStore) UpdateGoalPayload(id int64, text, vulnclass string) e
 	if vulnclass != "" {
 		payload["vulnclass"] = vulnclass
 	}
-	raw, _ := json.Marshal(payload)
-	res, err := s.db.Exec(`UPDATE exploration_nodes SET payload=$1 WHERE id=$2 AND exploration_id=$3 AND kind='goal'`, string(raw), id, s.expID)
+	payloadJSON, err := jsonArg(payload)
+	if err != nil {
+		return err
+	}
+	res, err := s.db.Exec(`UPDATE exploration_nodes SET payload=$1 WHERE id=$2 AND exploration_id=$3 AND kind='goal'`, payloadJSON, id, s.expID)
 	if err != nil {
 		return err
 	}
@@ -408,14 +605,52 @@ WHERE exploration_id=$1 AND kind='intent' AND state='running'`, s.expID)
 // The worker resumes from its prior LLM transcript instead of restarting from scratch.
 // done/open/running are left untouched. Returns whether a row changed. Used by "重跑".
 func (s *ExplorationStore) ReopenIntent(id int64) (bool, error) {
-	res, err := s.db.Exec(`UPDATE exploration_nodes
-SET state='open', completed_at=NULL, blocked_reason=NULL
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if err := s.lockIntentAdmissionTx(tx); err != nil {
+		return false, err
+	}
+	var raw []byte
+	if err := tx.QueryRow(`SELECT payload FROM exploration_nodes WHERE id=$1 AND exploration_id=$2 AND kind='intent' FOR UPDATE`, id, s.expID).Scan(&raw); err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return false, err
+	}
+	if _, collaboration := fields["collaborates_with"]; collaboration {
+		var used int64
+		if json.Unmarshal(fields["collaboration_wall_ms"], &used) != nil || used < 0 || used >= 600000 {
+			return false, fmt.Errorf("collaboration_budget: 协作累计预算已耗尽或不可用")
+		}
+		var others int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM exploration_nodes WHERE exploration_id=$1 AND kind='intent'
+		AND state IN ('open','running','paused') AND id<>$2 AND payload ? 'collaborates_with'`, s.expID, id).Scan(&others); err != nil {
+			return false, err
+		}
+		if others > 0 {
+			return false, fmt.Errorf("collaboration_rejected: 已有其它协作在途")
+		}
+	}
+	// A new attempt resets patrol clocks, never the one-shot allowance or the
+	// collaboration's cumulative meter stored in payload.
+	res, err := tx.Exec(`UPDATE exploration_nodes
+SET state='open', completed_at=NULL, blocked_reason=NULL, first_run_at=NULL, escalation_level=0
 WHERE id=$1 AND exploration_id=$2 AND kind='intent'
   AND state IN ('blocked','exhausted','stopped')`, id, s.expID)
 	if err != nil {
 		return false, err
 	}
 	n, _ := res.RowsAffected()
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
 	return n > 0, nil
 }
 
@@ -424,7 +659,8 @@ WHERE id=$1 AND exploration_id=$2 AND kind='intent'
 // number reopened. Workers resume from their transcripts; kept graph writes remain.
 func (s *ExplorationStore) ReopenBlockedIntents() (int64, error) {
 	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='open', completed_at=NULL, blocked_reason=NULL
-WHERE exploration_id=$1 AND kind='intent' AND state='blocked'`, s.expID)
+WHERE exploration_id=$1 AND kind='intent' AND state='blocked'
+AND NOT (payload ? 'collaborates_with')`, s.expID)
 	if err != nil {
 		return 0, err
 	}
@@ -466,10 +702,9 @@ type IntentCleanup struct {
 	Activities int64 `json:"activities"`
 }
 
-// SoftDeleteIntent 假删除一个待领/运行中/已暂停的意图:置 state='deleted' 并把用户填写的
-// 删除原因记入 delete_reason 字段,保留意图节点及其全部产出/血缘(不再像旧实现那样在图上
-// 另挂一条 fact)。返回删除前意图的 summary,供 planner 通知使用。副会话随删除态一并清理。
-// 调用方须先停掉运行中的 worker,避免其后续写入。
+// SoftDeleteIntent 假删除一个待领/已暂停的意图，保留节点与全部产出/血缘。
+// 行锁内拒绝 running，确保 API 读取 open 后若 worker 抢先 claim，删除返回冲突。
+// 调用方须先通过 ControlWork 等待运行中的 worker 完成最终写回。
 func (s *ExplorationStore) SoftDeleteIntent(id int64, reason string) (string, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -486,8 +721,8 @@ func (s *ExplorationStore) SoftDeleteIntent(id int64, reason string) (string, er
 		}
 		return "", err
 	}
-	if state != "running" && state != "paused" && state != "open" {
-		return "", fmt.Errorf("%w: intent state %s cannot be deleted", ErrIntentStateConflict, state)
+	if state != "paused" && state != "open" {
+		return "", fmt.Errorf("%w: intent state %s cannot be deleted before its worker stops", ErrIntentStateConflict, state)
 	}
 	if _, err := tx.Exec(`UPDATE exploration_nodes
 		SET state='deleted', delete_reason=$3, blocked_reason=NULL,
@@ -523,14 +758,17 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 	}
 	defer tx.Rollback()
 
-	// 锁定意图行确认存在(幂等:已删则 not found)。状态不校验——真删除对任何状态成立,
-	// running 的 worker 由调用方先停。
-	if err := tx.QueryRow(`SELECT 1 FROM exploration_nodes
-		WHERE id=$1 AND exploration_id=$2 AND kind='intent' FOR UPDATE`, id, s.expID).Scan(new(int)); err != nil {
+	// 先检查根节点，算出删除集后统一按 ID 加锁并再次校验，避免交错级联锁序倒置。
+	var state string
+	if err := tx.QueryRow(`SELECT state FROM exploration_nodes
+		WHERE id=$1 AND exploration_id=$2 AND kind='intent'`, id, s.expID).Scan(&state); err != nil {
 		if err == sql.ErrNoRows {
 			return out, fmt.Errorf("intent not found")
 		}
 		return out, err
+	}
+	if state != "open" && state != "paused" {
+		return out, fmt.Errorf("%w: intent state %s cannot be deleted before its worker stops", ErrIntentStateConflict, state)
 	}
 
 	// 载入全图节点(判 protected)与边(算向下可达 + 父集)。图规模对真实任务很小。
@@ -618,6 +856,26 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 		case KindFinding:
 			findingIDs = append(findingIDs, nid)
 			out.Findings++
+		}
+	}
+
+	// 根意图已经停止，独占后代仍可能在运行。按固定顺序锁住全部待删意图，
+	// 阻止清理期间被 claim；任何运行中后代都让整个事务回滚。
+	sort.Slice(intentIDs, func(i, j int) bool { return intentIDs[i] < intentIDs[j] })
+	for _, iid := range intentIDs {
+		var current string
+		if err := tx.QueryRow(`SELECT state FROM exploration_nodes
+			WHERE id=$1 AND exploration_id=$2 AND kind='intent' FOR UPDATE`, iid, s.expID).Scan(&current); err != nil {
+			if err == sql.ErrNoRows {
+				return out, fmt.Errorf("%w: descendant intent %d changed before cleanup", ErrIntentStateConflict, iid)
+			}
+			return out, err
+		}
+		if iid == id && current != "open" && current != "paused" {
+			return out, fmt.Errorf("%w: intent state %s cannot be deleted before its worker stops", ErrIntentStateConflict, current)
+		}
+		if current == "running" {
+			return out, fmt.Errorf("%w: descendant intent %d is running; stop it before deleting", ErrIntentStateConflict, iid)
 		}
 	}
 
@@ -908,13 +1166,20 @@ WHERE exploration_id=$1 AND kind='intent' AND state='open'`, s.expID).Scan(&n)
 // 判重刻意保守——只有【归一化后完全相同】或【互相包含且都足够长】才算相似，
 // 避免误杀"同一资产上的不同路线"这类合法细分意图。
 func (s *ExplorationStore) FindSimilarOpenIntent(summary string) (id int64, existing string, ok bool, err error) {
+	return findSimilarOpenIntent(s.db, s.expID, summary)
+}
+
+// 查询接口同时接受 DB 与事务，保证普通查重和准入查重使用完全相同的规则。
+func findSimilarOpenIntent(query interface {
+	Query(string, ...any) (*sql.Rows, error)
+}, explorationID int64, summary string) (id int64, existing string, ok bool, err error) {
 	norm := normalizeIntentText(summary)
 	if len([]rune(norm)) < 6 {
 		return 0, "", false, nil // 太短的描述没有判重意义
 	}
-	rows, err := s.db.Query(`SELECT id, COALESCE(payload->>'summary','') FROM exploration_nodes
+	rows, err := query.Query(`SELECT id, COALESCE(payload->>'summary','') FROM exploration_nodes
 WHERE exploration_id=$1 AND kind='intent' AND state IN ('open','running')
-ORDER BY id DESC LIMIT 200`, s.expID)
+ORDER BY id DESC LIMIT 200`, explorationID)
 	if err != nil {
 		return 0, "", false, err
 	}
@@ -1274,9 +1539,28 @@ func (s *ExplorationStore) Frontier(limit int) ([]*Node, error) {
 	if limit <= 0 {
 		limit = 50
 	}
+	// 排序：优先级 + 等待时间的加权（aging），防饥饿。
+	//
+	// 2026-11-05 实测（任务 333）：纯 `priority DESC, id ASC` 会导致**永久饥饿**。
+	// planner 按四维评分派单，新意图普遍是 6-10 分，于是早期派出的 3-5 分意图
+	// 永远排在后面——那轮任务结束时 78 条意图（占全部 421 条的 18.5%）从 17:21
+	// 等到 20:14，一条都没被领取过，而同期 343 条新意图正常跑完。
+	//
+	// 修法：每等待 30 分钟，有效优先级 +1，**加成上限 +7**（3.5 小时封顶）。
+	//
+	// 上限为什么是 7 而不是无限：第一版写成封顶 20，结果所有等够 5 小时的意图
+	// 都顶到 20，新意图（最高 10）永远排不上——从「老意图饿死」翻转成
+	// 「新意图饿死」。+7 的含义是「最多把一条意图当成高 7 分的来对待」：
+	// 老的 5 分等 3.5 小时后相当于 12 分，压过刚派的 8-10 分（它还债）；
+	// 但老的 3 分最多到 10 分，与刚派的 10 分同级，按 id 先来先服务。
+	// 这样既不饿死旧的，也不让陈旧方向永久霸占工人。
+	const ageBonusSec = 1800 // 30 分钟换 1 分
+	const ageBonusMax = 7
 	rows, err := s.db.Query(`SELECT `+nodeCols+` FROM exploration_nodes
 WHERE exploration_id=$1 AND kind='intent' AND state='open'
-ORDER BY priority DESC, id ASC LIMIT $2`, s.expID, limit)
+ORDER BY (payload ? 'collaborates_with') DESC,
+priority + LEAST((FLOOR(EXTRACT(EPOCH FROM (now()-created_at))/$2))::int, $3) DESC, id ASC
+LIMIT $4`, s.expID, ageBonusSec, ageBonusMax, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1308,7 +1592,11 @@ WHERE exploration_id=$1 AND kind='goal' AND state='open')`, s.expID).Scan(&exist
 
 // ClaimIntent atomically moves an open intent to running. Returns true if claimed.
 func (s *ExplorationStore) ClaimIntent(id int64, owner string) (bool, error) {
-	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='running', owner=$1
+	// first_run_at 只在**首次**领取时落章（COALESCE 保留第一次的值）：阶梯判据
+	// 看的是「这条意图从什么时候开始占用 worker」，重新领取不清零，否则一条反复
+	// 被抢/放的意图可以靠重置时钟永远逃过停放。真要重开是 ReopenIntent 的事。
+	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='running', owner=$1, updated_at=now(),
+first_run_at=COALESCE(first_run_at, now())
 WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state='open'`, owner, id, s.expID)
 	if err != nil {
 		return false, err
@@ -2206,19 +2494,7 @@ func (s *ExplorationStore) StallOverview() (rounds, recentNew, openCnt int, err 
 	return
 }
 
-// RetroBindIntentEvidence 把意图运行目录下全部未归属证据一次性绑定到漏洞。
-// 触发时机：report_finding 落库后——worker 先 save_evidence、后 report_finding，
-// 同一意图目录（/i<intentID>/）下 finding_id 为空的证据天然属于这个漏洞。
+// RetroBindIntentEvidence 复用已确认意图来源的补绑，task_id 保持 text 参数兼容。
 func (s *ExplorationStore) RetroBindIntentEvidence(taskID, intentID, findingID int64) (int, error) {
-	pattern := "%/i" + strconv.FormatInt(intentID, 10) + "/%"
-	res, err := s.db.Exec(`
-UPDATE task_artifacts
-SET finding_id=$3
-WHERE task_id=$1 AND finding_id IS NULL AND storage_path LIKE $2`,
-		taskID, pattern, findingID)
-	if err != nil {
-		return 0, err
-	}
-	n, _ := res.RowsAffected()
-	return int(n), nil
+	return s.db.RetroBindIntentEvidence(strconv.FormatInt(taskID, 10), intentID, findingID)
 }

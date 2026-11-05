@@ -6,7 +6,6 @@ package db
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -120,7 +119,10 @@ func (s *ExplorationStore) ActiveDigests() ([]*Node, error) {
 // single transaction. payload is the digest body + member_ids + generation +
 // signature (see cold-digest §1). Returns the new digest id.
 func (s *ExplorationStore) AddDigest(payload map[string]any, memberIDs []int64) (int64, error) {
-	raw, _ := json.Marshal(payload)
+	payloadJSON, err := jsonArg(payload)
+	if err != nil {
+		return 0, err
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, err
@@ -130,7 +132,7 @@ func (s *ExplorationStore) AddDigest(payload map[string]any, memberIDs []int64) 
 	if err := tx.QueryRow(`
 INSERT INTO exploration_nodes(exploration_id, kind, payload, priority, state, origin)
 VALUES ($1, $2, $3, 0, $4, 'compactor') RETURNING id`,
-		s.expID, KindDigest, string(raw), StateDigestActive).Scan(&id); err != nil {
+		s.expID, KindDigest, payloadJSON, StateDigestActive).Scan(&id); err != nil {
 		return 0, err
 	}
 	for _, m := range memberIDs {

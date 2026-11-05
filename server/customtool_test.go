@@ -6,10 +6,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os/exec"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/chu0119/pojun/db"
 )
 
 func TestRenderTemplateCommand(t *testing.T) {
@@ -34,6 +37,213 @@ func TestRenderTemplateHTTP(t *testing.T) {
 	got := renderTemplate("https://x/submit?flag={flag}", map[string]any{"flag": "CTF{abc}"}, identity)
 	if got != "https://x/submit?flag=CTF{abc}" {
 		t.Fatalf("http render: %q", got)
+	}
+}
+
+// 跨参数污染:参数值里的 {token} 是数据不是占位符,渲染后必须原样保留,
+// 不得被后续参数(token)替换掉。
+func TestCustomToolRenderNoCrossParamPollution(t *testing.T) {
+	got := renderTemplate("?flag={flag}", map[string]any{
+		"flag":  "CTF{token}",
+		"token": "s3cr3t",
+	}, identity)
+	if got != "?flag=CTF{token}" {
+		t.Fatalf("cross-param pollution: %q", got)
+	}
+	// 同样适用于 command(shellQuote)路径。
+	gotCmd := renderTemplate("submit {flag} {token}", map[string]any{
+		"flag":  "CTF{token}",
+		"token": "s3cr3t",
+	}, shellQuote)
+	if !strings.Contains(gotCmd, `'CTF{token}'`) || strings.Contains(gotCmd, "s3cr3t{token}") {
+		t.Fatalf("cross-param pollution (command): %q", gotCmd)
+	}
+}
+
+// 确定性:同一输入连续渲染 20 次结果必须一致(此前 map 遍历序随机会导致漂移)。
+func TestCustomToolRenderDeterministic(t *testing.T) {
+	tmpl := "nmap -p {ports} {target} --name {name} {missing}"
+	params := map[string]any{
+		"target": "10.0.0.1; rm -rf /",
+		"ports":  []any{80.0, 443.0},
+		"name":   "a'b {target}",
+	}
+	first := renderTemplate(tmpl, params, shellQuote)
+	for i := 0; i < 20; i++ {
+		if got := renderTemplate(tmpl, params, shellQuote); got != first {
+			t.Fatalf("render %d differs:\nfirst: %q\ngot:   %q", i, first, got)
+		}
+	}
+}
+
+// URL 按位置编码:query 部分用 QueryEscape、path 部分用 PathEscape。
+func TestCustomToolURLQuote(t *testing.T) {
+	got := renderTemplate("https://x/api/{path}?q={q}&r={r}", map[string]any{
+		"path": "a b/c?d",
+		"q":    "a&b=c d",
+		"r":    "x\r\nHost: evil",
+	}, urlQuote)
+	want := "https://x/api/" + url.PathEscape("a b/c?d") +
+		"?q=" + url.QueryEscape("a&b=c d") +
+		"&r=" + url.QueryEscape("x\r\nHost: evil")
+	if got != want {
+		t.Fatalf("urlQuote:\n got: %q\nwant: %q", got, want)
+	}
+	// 参数值中的结构字符(?、&、/、空格、CR/LF)必须全部被转义,不得原样出现。
+	for _, leak := range []string{" ", "\r", "\n"} {
+		if strings.Contains(got, leak) {
+			t.Fatalf("unescaped char %q leaked into url: %q", leak, got)
+		}
+	}
+}
+
+// 保存期与编辑器测试的校验应识别真实引号、转义及 shell word 边界。
+func TestCustomToolLintCommandTemplate(t *testing.T) {
+	bad := []string{
+		`curl "{url}"`,
+		`curl '{url}'`,
+		`curl -H "X: {token}"`,
+		`printf '%s' 'prefix {value} suffix'`,
+		`printf '%s' "prefix \"quoted\" {value}"`,
+		`printf '%s' "prefix \\ {value}"`,
+		`printf '%s' \" {value}"`,
+		`printf '%s' \{value}`,
+		`printf '%s' prefix\ {value}`,
+		`printf '%s' {value}\ suffix`,
+		`printf '%s' prefix{value}`,
+		`printf '%s' {value}suffix`,
+		`printf '%s' {a}{b}`,
+		`printf '%s' ""{value}`,
+		`printf '%s' {value}''`,
+		`printf '%s' --value={value}`,
+		`printf '%s' {value}#suffix`,
+		"printf '%s' \r{value}",
+		"printf '%s' {value}\r",
+		"printf '%s' prefix\\\n{value}",
+		"printf '%s' {value}\\\nsuffix",
+		"printf '%s' {value}\\\n{other}",
+		"printf '%s' `{value}`",
+		"printf '%s' `printf 'prefix %s' {value}`",
+		`printf '%s' ${value}`,
+		`printf '%s' ${other:- {value}}`,
+		`printf '%s' $(printf '%s' {value})`,
+		`printf '%s' $[1 + {value}]`,
+		`printf '%s' $'prefix {value}'`,
+		`printf '%s' $"prefix {value}"`,
+		"printf '%s' $\\\n'prefix {value}'",
+		`printf '%s' "$(printf '%s' {value})"`,
+		`printf '%s' $(printf static) {value}`,
+		`(printf '%s' {value})`,
+		"cat <<EOF\n{value}\nEOF",
+		"cat <\\\n<EOF\n{value}\nEOF",
+		`cat <<< {value}`,
+		`printf '%s' # {value}`,
+		`printf '%s' {value} "unterminated`,
+		"printf '%s' {value} \\",
+	}
+	for _, cmd := range bad {
+		t.Run("reject_"+cmd, func(t *testing.T) {
+			if err := lintCommandTemplate(cmd); err == nil {
+				t.Fatalf("应拒绝不安全模板 %q", cmd)
+			}
+			raw, err := json.Marshal(commandExec{Command: cmd})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := lintCustomToolExec("command", raw); err == nil {
+				t.Fatalf("保存与编辑器测试应拒绝不安全模板 %q", cmd)
+			}
+		})
+	}
+	good := []string{
+		`curl {url}`,
+		`nmap -p {ports} {target}`,
+		`echo hello`,
+		`echo "$(printf static)"`, // 无占位符的模板保持兼容。
+		`printf '%s' {value}`,
+		`printf '%s' {a} {b}`,
+		`printf '%s' "static value" {value}`,
+		`printf '%s' 'static value' {value}`,
+		`printf '%s' "static \"quoted\" value" {value}`,
+		`printf '%s' \"static\" {value}`,
+		`printf '%s' static\ value {value}`,
+		`printf '%s' \\ {value}`,
+		`printf '%s' "$HOME" {value}`,
+		`printf '%s' $HOME {value}`,
+		`printf '%s' '\$(literal) ` + "`literal`" + `' {value}`,
+		`printf '%s' \$HOME {value}`,
+		"printf '%s' \\`literal\\` {value}",
+		"printf '%s' \\\n{value}",
+		"printf '%s' {value}\\\n {other}",
+		"printf '%s'\t{value}\n",
+		`printf '%s' {value}|cat`,
+		`printf '%s' {value}; printf '%s' {other}`,
+		`printf '%s' {value} && printf '%s' {other}`,
+		`cat <{path}`,
+		"# 'unclosed quote ignored\nprintf '%s' {value}",
+		"printf static # unclosed \" quote\nprintf '%s' {value}",
+	}
+	for _, cmd := range good {
+		t.Run("accept_"+cmd, func(t *testing.T) {
+			if err := lintCommandTemplate(cmd); err != nil {
+				t.Fatalf("应接受合法模板 %q: %v", cmd, err)
+			}
+		})
+	}
+	if err := lintCommandTemplate(`curl "{url}"`); err == nil || !strings.Contains(err.Error(), "占位符必须独立成词") {
+		t.Fatalf("校验错误缺少使用指引: %v", err)
+	}
+	// script/http 的原始参数插值不受 command 校验限制。
+	for _, kind := range []string{"script", "http", "shell"} {
+		if err := lintCustomToolExec(kind, json.RawMessage(`{"command":"printf \"prefix {value}\""}`)); err != nil {
+			t.Fatalf("%s 类型不应进行 command 校验: %v", kind, err)
+		}
+	}
+	if err := lintCustomToolExec("command", nil); err != nil {
+		t.Fatalf("空 exec 应保留原行为: %v", err)
+	}
+	if err := lintCustomToolExec("command", json.RawMessage(`not json`)); err != nil {
+		t.Fatalf("格式错误的 exec 应交给执行器处理: %v", err)
+	}
+}
+
+// 历史数据库记录可能跳过保存期校验，执行器必须在调用 Bash 前拒绝。
+func TestCustomToolCommandRejectsUnsafeStoredTemplate(t *testing.T) {
+	for _, cmd := range []string{
+		`printf '%s' "prefix {value}"`,
+		`printf '%s' 'prefix {value}'`,
+		`printf '%s' prefix{value}`,
+		`printf '%s' {value}suffix`,
+	} {
+		t.Run(cmd, func(t *testing.T) {
+			raw, err := json.Marshal(commandExec{Command: cmd})
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := &Server{}
+			params := map[string]any{"value": "plain value"}
+			res, err := s.runCommandTool(context.Background(), raw, params, nil)
+			if err != nil || !res.IsError || !strings.Contains(res.Flatten(), "占位符必须独立成词") {
+				t.Fatalf("执行器未拒绝历史不安全模板: result=%+v, err=%v", res, err)
+			}
+			tool := s.buildCustomTool(&db.Tool{Key: "legacy_command", Kind: "command", Exec: raw})
+			res, err = tool.Call(context.Background(), json.RawMessage(`{"value":"plain value"}`), nil)
+			if err != nil || !res.IsError || !strings.Contains(res.Flatten(), "占位符必须独立成词") {
+				t.Fatalf("历史工具调用未拒绝不安全模板: result=%+v, err=%v", res, err)
+			}
+		})
+	}
+}
+
+func TestCustomToolCommandIndependentParams(t *testing.T) {
+	cmd := `printf '%s\n' {value} {other}`
+	if err := lintCommandTemplate(cmd); err != nil {
+		t.Fatalf("独立参数不应被拒绝: %v", err)
+	}
+	got := renderTemplate(cmd, map[string]any{"value": "a'b\nnext", "other": "two words"}, shellQuote)
+	want := "printf '%s\\n' 'a'\\''b\nnext' 'two words'"
+	if got != want {
+		t.Fatalf("独立参数未安全保留单引号、换行或空格:\n got: %q\nwant: %q", got, want)
 	}
 }
 
@@ -75,7 +285,7 @@ func TestEnsureSchema(t *testing.T) {
 }
 
 func TestShellQuote(t *testing.T) {
-	if got := shellQuote("a'b"); got != `'a'\''b'` {
+	if got := shellQuote("a'b", "", 0); got != `'a'\''b'` {
 		t.Fatalf("shellQuote(a'b) = %q", got)
 	}
 }

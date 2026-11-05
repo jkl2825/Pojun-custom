@@ -71,16 +71,29 @@ import (
 
 // idleStopDefaults 是无增量收尾的默认参数。
 const (
-	// idleStopRounds 是「连续多少轮没有写回就收场」。
+	// idleStopRounds 是「连续多少次工具执行没有写回」的**下限**条件之一。
 	//
-	// 3 轮的由来：worker 的正常节奏是「探测 → 写回 → 探测 → 写回」。偶尔有
-	// 1-2 轮只探测不写回是正常的（比如在准备一个多步利用链的中间步骤）。
-	// 连续 3 轮没有任何写回，基本可以判定这个方向已经探到边界或走偏了。
+	// 2026-11-05 调整：原值 3 太紧，实测把正常利用链误杀。任务 333 一晚触发
+	// 218 次、覆盖 122 个意图（占已完成意图三分之一），finding 产出在 15 点后
+	// 从 20/小时掉到 4/小时。根因是口径：一次工具执行算「一轮」，而一条利用链的
+	// 正常节奏是「写脚本 → 跑 → 解析回显 → 调整 → 再跑」，一个逻辑步骤就要
+	// 4-10 次工具执行，3 次必然误伤。
 	//
-	// 不取 1：单轮不写回太常见（写回前要先把结论想清楚），会误杀正常 worker。
-	// 不取 5：实测一个空转的 worker 能在 5 轮里烧掉几分钟 LLM 时间，而这段时间
-	// 完全不产生任何可用的产出。
-	idleStopRounds = 3
+	// 现在改成**双条件**：轮数达标 **且**（距上次写回超过 idleStopWindow
+	// **或** 轮数达到 idleStopHardRounds）。单纯「连着调几次工具」不再触发。
+	idleStopRounds = 10
+
+	// idleStopWindow 是「距上次写回的时间」下限。
+	//
+	// 为什么需要时间维度：轮数只反映「调了多少次」，不反映「花了多久」。
+	// 一个正在跑 timeout 260s 远程利用脚本的 worker，两三轮就是十几分钟，
+	// 轮数早就够了但它显然没空转。时间窗让「慢但有效」的探测不被误判。
+	idleStopWindow = 12 * time.Minute
+
+	// idleStopHardRounds 是**兜底硬上限**：无论时间窗是否满足，连续这么多次
+	// 工具执行都没有写回，就认定空转。防止「频繁失败但每次很快」的循环靠时间
+	// 窗逃过判据。
+	idleStopHardRounds = 30
 
 	// idleStopMinElapsed 是「至少已经跑了多久才允许按无增量收场」。
 	//
@@ -104,6 +117,15 @@ type idleStopper struct {
 	lastWrites int
 	// start 是本 run 的起点，用于起跑宽限期。
 	start time.Time
+	// lastWriteAt 是最近一次写回的时刻，用于「时间窗」条件。
+	//
+	// 与 rounds 互补：rounds 高但时间窗未到 → 说明它在跑慢动作（远程利用、
+	// 大字典扫描），不该收；时间窗到了但 rounds 未到 → 说明它调工具不频繁，
+	// 也不该按「空转」收。
+	lastWriteAt time.Time
+	// window 是时间窗阈值。留成字段（而不是直接用常量）是为了单测能把
+	// 时间窗置零、只验证轮数逻辑。
+	window time.Duration
 	// stopped 标记是否已经要求过收场（只要求一次）。
 	stopped bool
 	// nudged 记录是否已经给过「请写回并收手」的提示。提示过一次后若仍不停，
@@ -117,7 +139,8 @@ type idleStopper struct {
 }
 
 func newIdleStopper(writes func() WriteCounts) *idleStopper {
-	return &idleStopper{writes: writes, start: time.Now()}
+	now := time.Now()
+	return &idleStopper{writes: writes, start: now, lastWriteAt: now, window: idleStopWindow}
 }
 
 // check 记录本轮情况，必要时返回 prevent=true 要求收场。
@@ -142,7 +165,7 @@ func (s *idleStopper) check() (prevent bool, reason string) {
 	if time.Since(s.start) < idleStopMinElapsed {
 		return false, ""
 	}
-	if s.rounds < idleStopRounds {
+	if !s.trippedLocked() {
 		return false, ""
 	}
 	// 已经达过阈值：持续返回 prevent。
@@ -172,10 +195,30 @@ func (s *idleStopper) peek() (prevent bool, reason string) {
 	if time.Since(s.start) < idleStopMinElapsed {
 		return false, ""
 	}
-	if s.rounds < idleStopRounds {
+	if !s.trippedLocked() {
 		return false, ""
 	}
 	return true, fmt.Sprintf("连续%d轮无写回（本轮写回 %d 条，产出率已归零）", s.rounds, s.totalLocked())
+}
+
+// trippedLocked 判断是否达到空转判据。调用方必须持有 s.mu。
+//
+// 判据是**双条件**（2026-11-05 调整）：
+//   - 轮数下限 idleStopRounds（连续多少次工具执行没写回）
+//   - 且满足其一：距上次写回超过 window，**或** 轮数达到 idleStopHardRounds
+//
+// window<=0 时退化为纯轮数判据（单测用它验证轮数逻辑，不受墙上时间影响）。
+func (s *idleStopper) trippedLocked() bool {
+	if s.rounds >= idleStopHardRounds {
+		return true
+	}
+	if s.rounds < idleStopRounds {
+		return false
+	}
+	if s.window <= 0 {
+		return true
+	}
+	return time.Since(s.lastWriteAt) >= s.window
 }
 
 // advance 记一轮过去（一次工具执行）。
@@ -202,6 +245,7 @@ func (s *idleStopper) refreshLocked() bool {
 		s.rounds = 0
 		s.stopped = false
 		s.nudged = false
+		s.lastWriteAt = time.Now()
 		return true
 	}
 	return false
@@ -360,12 +404,17 @@ var idleStopWriteTools = map[string]bool{
 	"report_finding":  true,
 }
 
-// idleStopMessage 是收场时给模型的说明。
+// idleStopMessage 是拦住工具调用时给模型的说明。
 //
-// 说清「为什么收」很重要：模型看到「预算耗尽被终止」会以为是被惩罚，于是
-// 倾向于把还没验证的东西也写成结论；看到「这个方向没有新产出，请把已确认的
-// 写回并停手」它会正确地把已确认的收好。
-const idleStopMessage = "本轮已连续多轮没有任何新发现被写回——这个方向暂时探不到新的东西了。请立刻停止继续探测：把你**已经确认**的结果写回（资产用 insert_assets、结论用 record_fact、确认漏洞用 report_finding），然后用一句话纯文本总结你探到了什么、卡在哪里，结束本轮。不要为了「有产出」而把没验证的猜测写成事实。"
+// 2026-11-05 调整措辞：原文是「请立刻停止继续探测……结束本轮」，实测模型会
+// 直接放弃正在跑的利用链（任务 333 一夜 218 次触发）。现在改成
+// 「先写回、再判断是否继续」——把「收场」从一个命令降级成一个选项，
+// 避免把「暂时没写回」误当成「这个方向没价值」。
+//
+// 说清「为什么拦」很重要：模型看到「预算耗尽被终止」会以为是被惩罚，于是
+// 倾向于把还没验证的东西也写成结论；看到「这段时间没有写回，请先落库」它会
+// 正确处理。
+const idleStopMessage = "这段时间没有任何新发现被写回。请先把**已经确认**的结果落库（资产用 insert_assets、结论用 record_fact、确认漏洞用 report_finding），再判断是否继续：确有明确的下一步，写回后接着做；确实探到底了，就用一句话说明你探到了什么、卡在哪里，然后结束本条意图。不要为了「有产出」而把没验证的猜测写成事实。"
 
 // logIdleStop 记一条收场日志（统一格式，便于事后统计）。
 func logIdleStop(worker string, taskID int64, intentID int64, reason string) {

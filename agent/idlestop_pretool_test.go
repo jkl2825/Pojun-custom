@@ -26,6 +26,7 @@ import (
 func TestIdleStopFiresWhileWorkerKeepsCallingTools(t *testing.T) {
 	fw := &fakeWrites{}
 	hooks := wrapIdleStop(nil, fw.get, func(reason string) {})
+	hooks.stop.window = 0 // 测试不等时间窗
 	ageStopper(hooks.stop, time.Hour) // 越过起跑宽限期
 
 	// 模拟一个持续调工具的 worker：每一轮 PreToolUse 都过，工具也都执行了，
@@ -37,8 +38,10 @@ func TestIdleStopFiresWhileWorkerKeepsCallingTools(t *testing.T) {
 			if !strings.Contains(msg, "写回") {
 				t.Errorf("拦截消息应说明要写回: %q", msg)
 			}
-			if !strings.Contains(msg, "停止") && !strings.Contains(msg, "收手") {
-				t.Errorf("拦截消息应要求停止探测: %q", msg)
+			// 2026-11-05：提示语从「立刻停止探测」改成「先写回再判断是否继续」，
+			// 所以这里验证它给出了继续/结束的判据，而不是硬命令停止。
+			if !strings.Contains(msg, "结束") && !strings.Contains(msg, "继续") {
+				t.Errorf("拦截消息应说明写回后如何继续或结束: %q", msg)
 			}
 			return
 		}
@@ -52,6 +55,7 @@ func TestIdleStopFiresWhileWorkerKeepsCallingTools(t *testing.T) {
 func TestIdleStopDoesNotBlockProductiveWorker(t *testing.T) {
 	fw := &fakeWrites{}
 	hooks := wrapIdleStop(nil, fw.get, func(string) {})
+	hooks.stop.window = 0 // 测试不等时间窗
 	ageStopper(hooks.stop, time.Hour)
 
 	for round := 0; round < 10; round++ {
@@ -70,6 +74,7 @@ func TestIdleStopPreToolUseNudgesThenStops(t *testing.T) {
 	fw := &fakeWrites{}
 	stoppedReason := ""
 	hooks := wrapIdleStop(nil, fw.get, func(reason string) { stoppedReason = reason })
+	hooks.stop.window = 0 // 测试不等时间窗
 	ageStopper(hooks.stop, time.Hour)
 
 	// 阈值是连续 idleStopRounds 轮无写回，所以前几轮都放行。
@@ -113,6 +118,7 @@ func TestIdleStopPreToolUseStillCallsInner(t *testing.T) {
 	fw := &fakeWrites{}
 	inner := &recordingHookRunner{}
 	hooks := wrapIdleStop(inner, fw.get, func(string) {})
+	hooks.stop.window = 0 // 测试不等时间窗
 	ageStopper(hooks.stop, time.Hour)
 
 	// 零写回达到阈值 → 我们的判据要拦住。
@@ -154,6 +160,7 @@ var _ harness.HookRunner = (*recordingHookRunner)(nil)
 func TestIdleStopNeverBlocksWriteBackTools(t *testing.T) {
 	fw := &fakeWrites{}
 	hooks := wrapIdleStop(nil, fw.get, func(string) {})
+	hooks.stop.window = 0 // 测试不等时间窗
 	ageStopper(hooks.stop, time.Hour)
 
 	// 先把计数推到阈值（连续零写回）。
@@ -177,6 +184,7 @@ func TestIdleStopNeverBlocksWriteBackTools(t *testing.T) {
 func TestIdleStopWriteBackDoesNotAdvanceCounter(t *testing.T) {
 	fw := &fakeWrites{}
 	hooks := wrapIdleStop(nil, fw.get, func(string) {})
+	hooks.stop.window = 0 // 测试不等时间窗
 	ageStopper(hooks.stop, time.Hour)
 
 	// 两轮探测工具（零写回）→ 计数 2。

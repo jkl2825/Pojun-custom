@@ -193,6 +193,13 @@ CREATE TABLE IF NOT EXISTS exploration_nodes (
     )
 );
 ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS blocked_reason TEXT;
+-- 意图阶梯（2026-11-05）：first_run_at 记录首次进入 running 的时刻，用于算
+-- 「这条意图已经跑了多久」；escalation_level 记录它已经升到第几档（0=未干预，
+-- 1=已纠偏，3=已停放）。判定见 server/escalation.go。
+-- 不复用 created_at：意图可能在 frontier 里排队几小时（实测最长 11.6 小时），
+-- 那是等待时间，不是执行时间。
+ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS first_run_at TIMESTAMPTZ;
+ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS escalation_level INT NOT NULL DEFAULT 0;
 -- 意图假删除(soft delete):state='deleted' 时,delete_reason 记用户填写的删除原因。
 ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS delete_reason TEXT;
 -- cold-digest (§2.3/§5.3): content_version bumps on any change that could alter a

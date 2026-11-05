@@ -37,10 +37,20 @@ func ageStopper(s *idleStopper, d time.Duration) {
 	s.mu.Unlock()
 }
 
+// newStopperForTest 造一个「只按轮数判定」的 stopper（时间窗置零）。
+// 生产默认要求轮数达标且距上次写回超过 12 分钟；测试不该真的等 12 分钟，
+// 所以这里把窗口关掉，只验证轮数/写回重置/宽限期这些逻辑。
+// 时间窗本身另有专门用例（TestIdleStopWindowBlocksEarlyTrip）。
+func newStopperForTest(w func() WriteCounts) *idleStopper {
+	s := newIdleStopper(w)
+	s.window = 0
+	return s
+}
+
 // 连续无写回达到阈值时必须要求收场。
 func TestIdleStopFiresAfterNoWrites(t *testing.T) {
 	fw := &fakeWrites{}
-	s := newIdleStopper(fw.get)
+	s := newStopperForTest(fw.get)
 	ageStopper(s, time.Hour) // 越过起跑宽限期
 
 	// 前两轮：还没到阈值。
@@ -62,7 +72,7 @@ func TestIdleStopFiresAfterNoWrites(t *testing.T) {
 // 这是「深度优先不受影响」这条设计的关键。
 func TestIdleStopResetsOnWrite(t *testing.T) {
 	fw := &fakeWrites{}
-	s := newIdleStopper(fw.get)
+	s := newStopperForTest(fw.get)
 	ageStopper(s, time.Hour)
 
 	// 连续两轮无写回。
@@ -87,7 +97,7 @@ func TestIdleStopResetsOnWrite(t *testing.T) {
 // 起跑宽限期内不收场——worker 刚起手的前几轮可能在做准备工作。
 func TestIdleStopHasGracePeriod(t *testing.T) {
 	fw := &fakeWrites{}
-	s := newIdleStopper(fw.get)
+	s := newStopperForTest(fw.get)
 	// 刚起跑（start = now），宽限期没过。
 	for i := 0; i < idleStopRounds+3; i++ {
 		if prevent, _ := s.check(); prevent {
@@ -102,6 +112,7 @@ func TestIdleStopNudgesBeforeStopping(t *testing.T) {
 	fw := &fakeWrites{}
 	inner := &spyHook{}
 	h := wrapIdleStop(inner, fw.get, nil)
+	h.stop.window = 0 // 测试不等时间窗
 	ageStopper(h.stop, time.Hour)
 
 	ctx := context.Background()
@@ -138,6 +149,7 @@ func TestIdleStopNudgesBeforeStopping(t *testing.T) {
 func TestIdleStopStopsNudgingAfterWrite(t *testing.T) {
 	fw := &fakeWrites{}
 	h := wrapIdleStop(nil, fw.get, nil)
+	h.stop.window = 0 // 测试不等时间窗
 	ageStopper(h.stop, time.Hour)
 
 	ctx := context.Background()
@@ -164,6 +176,7 @@ func TestIdleStopRespectsInnerStop(t *testing.T) {
 	inner := &blockingHook{prevent: true, msg: "平台管控拦截"}
 	fw := &fakeWrites{}
 	h := wrapIdleStop(inner, fw.get, nil)
+	h.stop.window = 0 // 测试不等时间窗
 	ageStopper(h.stop, time.Hour)
 
 	prevent, _, msg := h.Stop(context.Background(), nil)
@@ -199,6 +212,7 @@ func TestIdleStopAppliesWhenInnerAllows(t *testing.T) {
 	inner := &spyHook{}
 	fw := &fakeWrites{}
 	h := wrapIdleStop(inner, fw.get, nil)
+	h.stop.window = 0 // 测试不等时间窗
 	ageStopper(h.stop, time.Hour)
 
 	ctx := context.Background()
@@ -220,6 +234,7 @@ func TestIdleStopForwardsToolHooks(t *testing.T) {
 	inner := &spyHook{}
 	fw := &fakeWrites{}
 	h := wrapIdleStop(inner, fw.get, nil)
+	h.stop.window = 0 // 测试不等时间窗
 	ctx := context.Background()
 
 	h.PreToolUse(ctx, "Bash", []byte(`{"command":"ls"}`))
@@ -232,7 +247,7 @@ func TestIdleStopForwardsToolHooks(t *testing.T) {
 
 // 写回函数为 nil 时不能 panic（防御性：ToolSet 总是有的，但别依赖它）。
 func TestIdleStopNilWritesSafe(t *testing.T) {
-	s := newIdleStopper(nil)
+	s := newStopperForTest(nil)
 	ageStopper(s, time.Hour)
 	for i := 0; i < idleStopRounds; i++ {
 		s.check()
@@ -246,7 +261,7 @@ func TestIdleStopNilWritesSafe(t *testing.T) {
 // 「被墙钟掐断」和「这个方向本身没东西了」，这两种在决策上完全相反。
 func TestIdleStopReasonExplainsWhy(t *testing.T) {
 	fw := &fakeWrites{}
-	s := newIdleStopper(fw.get)
+	s := newStopperForTest(fw.get)
 	ageStopper(s, time.Hour)
 	for i := 0; i < idleStopRounds; i++ {
 		s.check()
@@ -256,6 +271,38 @@ func TestIdleStopReasonExplainsWhy(t *testing.T) {
 		if !strings.Contains(reason, want) {
 			t.Errorf("收场原因缺少 %q: %q", want, reason)
 		}
+	}
+}
+
+// 时间窗未到：轮数再多也不收——保护「慢但有效」的远程利用。
+//
+// 任务 333 的教训：一条 timeout 260s 的远程利用链，两三轮就是十几分钟，
+// 轮数早就过阈值但它显然没空转。判据必须有时间维度。
+func TestIdleStopWindowBlocksEarlyTrip(t *testing.T) {
+	fw := &fakeWrites{}
+	s := newIdleStopper(fw.get) // 生产默认窗口
+	ageStopper(s, time.Hour)    // 越过起跑宽限期
+
+	for i := 0; i < idleStopRounds+2; i++ {
+		s.advance()
+	}
+	if prevent, reason := s.peek(); prevent {
+		t.Fatalf("距上次写回不足一个时间窗，不该判空转: %s", reason)
+	}
+}
+
+// 硬上限：连续调用次数极多时，即使时间窗未到也判空转（防「快速失败空转」）。
+func TestIdleStopHardRoundsIgnoresWindow(t *testing.T) {
+	fw := &fakeWrites{}
+	s := newIdleStopper(fw.get)
+	s.window = time.Hour // 时间窗故意拉长
+	ageStopper(s, time.Hour)
+
+	for i := 0; i < idleStopHardRounds; i++ {
+		s.advance()
+	}
+	if prevent, _ := s.peek(); !prevent {
+		t.Fatalf("连续 %d 轮无写回应触发硬上限", idleStopHardRounds)
 	}
 }
 

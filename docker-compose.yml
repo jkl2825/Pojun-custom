@@ -30,8 +30,11 @@ services:
       POJUN_LLM_BASE_URL: ${POJUN_LLM_BASE_URL:-}
       POJUN_LLM_PROXY: ${POJUN_LLM_PROXY:-}
     ports:
-      - "8787:8787"
-      - "127.0.0.1:8788:8788"
+      # 宿主端口可通过 .env 覆盖。注意：Windows 上 8787 常被 WSL 的 wslrelay.exe
+      # 绑定到 127.0.0.1（它比 0.0.0.0 更具体），会把 localhost 流量绕进 WSL 虚拟机，
+      # 虚拟机休眠时表现为「localhost 间歇打不开」。故本机默认改用 8887。
+      - "${POJUN_UI_PORT:-8787}:8787"
+      - "127.0.0.1:${POJUN_PROXY_PORT:-8788}:8788"
       # 回连端口映射(按需放开):容器内 MSF/listener 监听的端口要映射到宿主,
       # agent 才能收到 reverse shell。示例(解除注释并按需改):
       # - "4444-4450:4444-4450"

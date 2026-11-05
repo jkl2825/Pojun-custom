@@ -182,10 +182,23 @@ var catalog = []Tool{
 		Repo: "projectdiscovery/dnsx", AssetTmpl: "dnsx_{ver}_linux_{arch}.zip"},
 	{Name: "katana", Purpose: "Web 爬虫(爬深层路径与参数)", Kind: KindGitHub, Category: CatWeb,
 		Repo: "projectdiscovery/katana", AssetTmpl: "katana_{ver}_linux_{arch}.zip"},
+	// waybackurls / gau：历史 URL 收集。katana 只爬当前站点，挖不到早已下线但
+	// 仍可访问的老接口/老参数，这两个走第三方存档(wayback/otx/commoncrawl)补这块。
+	// 资产命名：waybackurls 是 `名称-linux-架构-版本.tgz`（架构在中间、无 v 前缀），
+	// gau 是标准 `gau_版本_linux_架构.tar.gz`——两者不同构，模板不能复用。
+	{Name: "waybackurls", Purpose: "历史 URL 收集(Wayback Machine, 挖已下线接口)", Kind: KindGitHub, Category: CatWeb,
+		Repo: "tomnomnom/waybackurls", AssetTmpl: "waybackurls-linux-{arch}-{ver}.tgz"},
+	{Name: "gau", Purpose: "历史 URL 收集(wayback/otx/commoncrawl 多源聚合)", Kind: KindGitHub, Category: CatWeb,
+		Repo: "lc/gau", AssetTmpl: "gau_{ver}_linux_{arch}.tar.gz"},
 	{Name: "tlsx", Purpose: "TLS 证书信息提取(证书/ SAN / 过期)", Kind: KindGitHub, Category: CatNetwork,
 		Repo: "projectdiscovery/tlsx", AssetTmpl: "tlsx_{ver}_linux_{arch}.zip"},
 
 	{Name: "wafw00f", Purpose: "WAF 识别", Kind: KindPip, Category: CatWeb, Pip: "wafw00f"},
+	// arjun / commix：ffuf 能爆破已知参数位，但发现不了"字段名未知"的隐藏参数
+	// （arjun 干这个）；命令注入手工试 payload 效率低（commix 干这个）。
+	// 两者都是带 CLI 入口的 pip 应用，走 pipx 也能装，这里用 pip 与现网一致。
+	{Name: "arjun", Purpose: "HTTP 隐藏参数发现(GET/POST 字段枚举)", Kind: KindPip, Category: CatWeb, Pip: "arjun"},
+	{Name: "commix", Purpose: "命令注入检测与利用", Kind: KindPip, Category: CatWeb, Pip: "commix"},
 	// impacket 是 SMB/NTLM/票据的 Python 库(提供 msmfmap、ntlmrelay、secretsdump
 	// 等脚本)。apt 源里的包名是 python3-impacket,Debian/Ubuntu 都有。
 	{Name: "impacket", Purpose: "SMB/NTLM 协议工具集(secretsdump/ntlmrelay 等)", Kind: KindApt, Category: CatCred,

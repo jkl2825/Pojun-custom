@@ -15,6 +15,29 @@ type TaskClock struct {
 	FinalReason  string // "timeout" | "auto_idle" | "auto_coverage" | "auto_rounds"
 }
 
+// DispatchPolicy carries the runtime's actual capacity and current-round budget.
+// Only the autonomous planner enables it; human-directed intents keep their
+// existing control path. It never selects models or expands tool permissions.
+type DispatchPolicy struct {
+	WorkerSlots int
+	Round       int
+	MaxRounds   int // 0 disables the round ceiling
+}
+
+type dispatchPolicyKey struct{}
+
+func WithDispatchPolicy(ctx context.Context, p DispatchPolicy) context.Context {
+	return context.WithValue(ctx, dispatchPolicyKey{}, p)
+}
+
+func dispatchPolicyFrom(ctx context.Context) DispatchPolicy {
+	if p, ok := ctx.Value(dispatchPolicyKey{}).(DispatchPolicy); ok {
+		return p
+	}
+	// Missing runtime information is not permission to guess available workers.
+	return DispatchPolicy{}
+}
+
 type taskClockKey struct{}
 
 // WithTaskClock attaches a TaskClock to ctx for the run.

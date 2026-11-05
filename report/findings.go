@@ -140,8 +140,33 @@ func FindingFilename(f *db.DBFinding) string {
 	return name + ".md"
 }
 
+// csvSafe 缓解 CSV/公式注入：Excel 打开导出的 CSV 时，以 =、+、-、@ 开头的单元格
+// 会被当作公式执行（可外带数据或触发远端引用）。finding 的 name/summary 等字段
+// 由 agent 生成、内容来自目标站点，属于不可信文本，写入 CSV 前须过本函数。
+// 判断按 TrimSpace 后的首字符（Excel 解析时前导空白不影响公式触发），但输出
+// 保留原文、仅在前面补一个单引号（Excel 兼容的标准转义，单元格按纯文本显示）。
+// 制表符/回车开头同样加引号，避免被 Excel 当作特殊前缀处理。
+func csvSafe(s string) string {
+	if s == "" {
+		return s
+	}
+	t := strings.TrimSpace(s)
+	if t != "" {
+		switch t[0] {
+		case '=', '+', '-', '@':
+			return "'" + s
+		}
+	}
+	switch s[0] {
+	case '\t', '\r':
+		return "'" + s
+	}
+	return s
+}
+
 // FindingsCSV 把一批 findings 渲染成 CSV(带 UTF-8 BOM,便于 Excel 正确识别中文)。
 // 不含大段 report/evidence 全文,只放摘要类字段;需要全文用 Markdown/JSON 导出。
+// 文本类字段均经 csvSafe 转义,防止操作员用 Excel 打开时触发公式注入。
 func FindingsCSV(fs []*db.DBFinding) []byte {
 	items := append([]*db.DBFinding(nil), fs...)
 	sortFindingsForExport(items)
@@ -153,13 +178,13 @@ func FindingsCSV(fs []*db.DBFinding) []byte {
 	for _, f := range items {
 		_ = w.Write([]string{
 			fmt.Sprintf("%d", f.ID),
-			findingTitle(f),
-			f.VulnClass,
-			nz(f.Severity, "info"),
-			nz(f.Status, "pending"),
-			f.TaskDescription,
+			csvSafe(findingTitle(f)),
+			csvSafe(f.VulnClass),
+			csvSafe(nz(f.Severity, "info")),
+			csvSafe(nz(f.Status, "pending")),
+			csvSafe(f.TaskDescription),
 			f.CreatedAt.Format("2006-01-02 15:04:05"),
-			strings.TrimSpace(f.Summary),
+			csvSafe(strings.TrimSpace(f.Summary)),
 			fmt.Sprint(len(f.TrafficBindings)), findingTrafficIDs(f),
 		})
 	}

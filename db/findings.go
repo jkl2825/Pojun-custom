@@ -395,6 +395,12 @@ func (s *ExplorationStore) AddFindingFollowUpIntent(findingID, findingNodeID int
 		return 0, Activity{}, err
 	}
 	defer tx.Rollback()
+	// Share the exploration-level admission lock with autonomous dispatch.
+	// Human follow-ups remain exempt from its queue cap, not from serialization.
+	var lockedExploration int64
+	if err := tx.QueryRow(`SELECT id FROM explorations WHERE id=$1 FOR UPDATE`, s.expID).Scan(&lockedExploration); err != nil {
+		return 0, Activity{}, err
+	}
 
 	var liveNodeID int64
 	err = tx.QueryRow(`SELECT n.id

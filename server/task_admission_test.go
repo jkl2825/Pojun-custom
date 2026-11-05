@@ -213,6 +213,19 @@ func TestTerminalTaskQueuedByAdmissionKeepsExecutionBarrier(t *testing.T) {
 }
 
 func TestTimedOutTaskRevivalResetsClockAndSettlingAcrossFIFO(t *testing.T) {
+	testTerminalTaskRevivalResetsClockAndSettlingAcrossFIFO(t, "timeout")
+}
+
+func TestTerminalTaskRevivalResetsClockAndSettlingAcrossFIFO(t *testing.T) {
+	for _, status := range []string{"done", "failed"} {
+		t.Run(status, func(t *testing.T) {
+			testTerminalTaskRevivalResetsClockAndSettlingAcrossFIFO(t, status)
+		})
+	}
+}
+
+func testTerminalTaskRevivalResetsClockAndSettlingAcrossFIFO(t *testing.T, status string) {
+	t.Helper()
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
@@ -242,19 +255,42 @@ func TestTimedOutTaskRevivalResetsClockAndSettlingAcrossFIFO(t *testing.T) {
 	if oldClock.FirstRunAt == 0 || oldClock.DeadlineAt == 0 {
 		t.Fatalf("test setup did not stamp the original clock: %+v", oldClock)
 	}
-	if err := m.SetTaskStatus(task.ID, "timeout"); err != nil {
+	if err := m.SetTaskStatus(task.ID, status); err != nil {
 		t.Fatal(err)
 	}
 
 	s := newAdmissionTestServer(m, nil)
-	s.engine.settling.Store(task.ID, true)
+	s.engine.settling.Store(task.ID, "goal_met")
 	s.engine.deadline.Store(task.ID, oldClock.DeadlineAt)
 	s.engine.stamped.Store(task.ID, true)
-	s.engine.coordStarted.Store(task.ID, true)
+	s.engine.plannerRound.Store(task.ID, 80)
+	if _, err := m.pg.RecordTaskProgress(task.ID, 80, 1, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	oldCoordCtx, oldCoordCancel := context.WithCancel(context.Background())
+	defer oldCoordCancel()
+	s.engine.coordStarted.Store(task.ID, &deadlineCoordinatorRun{cancel: oldCoordCancel})
+	task.requestSettle("auto_idle", "上一轮挂起收尾")
 
-	queued, err := s.admitTask(task, "resume")
+	result, err := s.applyTaskControl(task, "resume")
 	if err != nil {
 		t.Fatal(err)
+	}
+	queued := result.Queued
+	if oldCoordCtx.Err() == nil {
+		t.Fatal("终态续跑未取消旧协调器")
+	}
+	if _, ok := s.engine.coordStarted.Load(task.ID); ok {
+		t.Fatal("排队期间仍保留旧协调器标记")
+	}
+	if reason, _ := task.peekSettle(); reason != "" {
+		t.Fatalf("终态续跑仍保留挂起收尾 %q", reason)
+	}
+	if round := s.engine.nextPlannerRound(task.ID); round != 1 {
+		t.Fatalf("终态续跑沿用旧规划轮数: %d", round)
+	}
+	if progress, err := m.pg.GetTaskProgress(task.ID); err != nil || progress != nil {
+		t.Fatalf("终态续跑保留旧轮进度: progress=%+v err=%v", progress, err)
 	}
 	queuedState := task.lifecycleSnapshot()
 	if !queued || !queuedState.Queued || queuedState.Status != "running" ||
@@ -294,7 +330,166 @@ func TestTimedOutTaskRevivalResetsClockAndSettlingAcrossFIFO(t *testing.T) {
 		t.Fatalf("revived task did not receive a live execution context: %v", context.Cause(execCtx))
 	}
 	if _, ok := s.engine.coordStarted.Load(task.ID); !ok {
-		t.Fatal("revived timeout task did not start a fresh deadline coordinator")
+		t.Fatal("续跑任务未启动新一轮超时协调器")
+	}
+	s.engine.stampFirstRun(task)
+	fresh, err := m.pg.GetTask(mustTaskID(t, task.ID))
+	if err != nil || fresh == nil || fresh.FirstRunAt == nil || fresh.DeadlineAt == nil ||
+		fresh.DeadlineAt.Sub(*fresh.FirstRunAt) != 120*time.Second {
+		t.Fatalf("续跑预算未重新盖章: task=%+v err=%v", fresh, err)
+	}
+}
+
+func TestSettledDoneResumeKeepsRuntimeAndClearsSettling(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres 不可用 (%v)", err)
+	}
+	defer m.Close()
+	defer restoreConcurrencySetting(t, m)()
+	if err := m.SetConcurrency(false, defaultConcurrencyLimit); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.CreateTask("settled resume", "继续已有运行时", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.DeleteTask(task.ID, DeleteTaskOptions{}) }()
+	s := newAdmissionTestServer(m, nil)
+	s.engine.started.Store(task.ID, true)
+	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
+	defer runtimeCancel()
+	rt := &taskRuntime{ctx: runtimeCtx, cancel: runtimeCancel}
+	s.engine.runtimes[task.ID] = rt
+	s.engine.settleTaskWithReason(context.Background(), task, "goal_met", "目标已达成")
+	if task.lifecycleSnapshot().Status != "done" || !s.engine.isSettling(task.ID) {
+		t.Fatal("测试前提未经过真实收尾路径")
+	}
+	result, err := s.applyTaskControl(task, "resume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "running" || result.Queued || s.engine.isSettling(task.ID) || s.engine.IsPaused(task.ID) {
+		t.Fatalf("终态继续后执行门未打开: result=%+v", result)
+	}
+	if s.engine.runtimes[task.ID] != rt || runtimeCtx.Err() != nil {
+		t.Fatal("终态继续重建或取消了仍存活的 planner/worker 运行时")
+	}
+	if execCtx := s.engine.execContextFor(context.Background(), task.ID); execCtx.Err() != nil {
+		t.Fatalf("终态继续无法取得新执行上下文: %v", context.Cause(execCtx))
+	}
+}
+
+func TestTerminalTaskControlResumeSerializesWithPause(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres 不可用 (%v)", err)
+	}
+	defer m.Close()
+	defer restoreConcurrencySetting(t, m)()
+	if err := m.SetConcurrency(false, defaultConcurrencyLimit); err != nil {
+		t.Fatal(err)
+	}
+	task, err := m.CreateTask("resume pause race", "继续与暂停串行提交", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.DeleteTask(task.ID, DeleteTaskOptions{}) }()
+	if err := m.SetTaskStatus(task.ID, "done"); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	s := newAdmissionTestServer(m, func(*Task) bool {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+		return true
+	})
+	resumed := make(chan error, 1)
+	go func() {
+		_, err := s.applyTaskControl(task, "resume")
+		resumed <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("终态继续未进入统一准入")
+	}
+	paused := make(chan error, 1)
+	go func() {
+		_, err := s.applyTaskControl(task, "pause")
+		paused <- err
+	}()
+	select {
+	case err := <-paused:
+		t.Fatalf("准入提交前暂停越过调度锁: %v", err)
+	default:
+	}
+	close(release)
+	if err := <-resumed; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-paused; err != nil {
+		t.Fatal(err)
+	}
+	stored, err := m.pg.GetTask(mustTaskID(t, task.ID))
+	if err != nil || stored == nil || !stored.Paused || !s.engine.IsPaused(task.ID) {
+		t.Fatalf("后续暂停被继续覆盖: stored=%+v enginePaused=%v err=%v", stored, s.engine.IsPaused(task.ID), err)
+	}
+}
+
+func TestTerminalTaskControlResumeRespectsReadyFIFO(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres 不可用 (%v)", err)
+	}
+	defer m.Close()
+	defer restoreConcurrencySetting(t, m)()
+	if err := m.SetConcurrency(true, 2); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := m.CreateTask("holder", "占用运行槽", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	older, err := m.CreateTask("older", "先排队", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := m.CreateTask("terminal", "终态继续", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = m.DeleteTask(holder.ID, DeleteTaskOptions{})
+		_, _ = m.DeleteTask(older.ID, DeleteTaskOptions{})
+		_, _ = m.DeleteTask(terminal.ID, DeleteTaskOptions{})
+	}()
+	if err := m.EnqueueTask(older.ID, "resume"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetTaskStatus(terminal.ID, "done"); err != nil {
+		t.Fatal(err)
+	}
+	s := newAdmissionTestServer(m, nil)
+	s.engine.Pause(older.ID, agent.AbortPausedByUser)
+	result, err := s.applyTaskControl(terminal, "resume")
+	if err != nil || !result.Queued {
+		t.Fatalf("终态继续绕过已有 FIFO: result=%+v err=%v", result, err)
+	}
+	s.reconcileConcurrency()
+	if older.lifecycleSnapshot().Queued || !terminal.lifecycleSnapshot().Queued {
+		t.Fatal("终态继续抢占了更早的排队任务")
 	}
 }
 

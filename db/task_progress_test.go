@@ -1,6 +1,7 @@
 package db
 
 import (
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -62,5 +63,63 @@ func TestCountExplorationProgress(t *testing.T) {
 	facts, findings, err := d.CountExplorationProgress(-12345)
 	if err != nil || facts != 0 || findings != 0 {
 		t.Fatalf("empty exploration facts=%d findings=%d err=%v", facts, findings, err)
+	}
+}
+
+func TestCollaborationRuntimeAccumulatesAndCapsAcrossResumes(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	exp, err := d.CreateExploration("runtime accounting", "bounded retries")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, exp)
+	s := d.Exploration(exp)
+	id, err := s.AddIntent(map[string]any{"summary": "bounded", "collaborates_with": 10, "collaboration_wall_ms": 0}, 8, nil, "planner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readUsed := func() int64 {
+		n, err := s.GetNode(id)
+		if err != nil || n == nil {
+			t.Fatalf("read: %v", err)
+		}
+		var fields struct {
+			Used int64 `json:"collaboration_wall_ms"`
+		}
+		if err := json.Unmarshal(n.Payload, &fields); err != nil {
+			t.Fatal(err)
+		}
+		return fields.Used
+	}
+	if err := s.RecordCollaborationRuntime(id, 125000); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetIntentState(id, "paused"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordCollaborationRuntime(id, 70000); err != nil {
+		t.Fatal(err)
+	}
+	if got := readUsed(); got != 195000 {
+		t.Fatalf("pause/retry reset the meter: %d", got)
+	}
+	if err := s.RecordCollaborationRuntime(id, 600000); err != nil {
+		t.Fatal(err)
+	}
+	if got := readUsed(); got != 600000 {
+		t.Fatalf("cap=%d", got)
+	}
+	if err := s.MergeIntentPayload(id, map[string]any{"collaboration_wall_ms": "invalid"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordCollaborationRuntime(id, 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := readUsed(); got != 600000 {
+		t.Fatalf("malformed accounting reopened budget: %d", got)
 	}
 }

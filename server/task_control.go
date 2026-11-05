@@ -86,9 +86,8 @@ func (s *Server) resumeAdmissionMode(t *Task) string {
 	return "resume"
 }
 
-// applyTaskControl is shared by the single and batch endpoints. Task resume is
-// deliberately limited to paused tasks; reruns and finding follow-ups use
-// admitTask directly when they need to revive a terminal task.
+// applyTaskControl 由单任务与批量接口共用。暂停和终态任务的继续操作
+// 都经统一准入路径，在同一调度锁下检查状态、并发上限及 FIFO。
 func (s *Server) applyTaskControl(t *Task, action string) (taskControlResult, error) {
 	return s.applyTaskControlWithCause(t, action, agent.AbortPausedByUser)
 }
@@ -136,7 +135,7 @@ func (s *Server) applyTaskControlWithCause(t *Task, action string, pauseCause er
 		out.Paused, out.Status = true, "paused"
 		go s.reconcileConcurrency()
 	case "resume":
-		queued, err := s.admitPausedTask(t)
+		queued, err := s.admitResumableTask(t)
 		if err != nil {
 			return out, err
 		}

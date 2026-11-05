@@ -58,3 +58,12 @@ __pycache__/
 *.pyc
 .build-tmp/
 peers/
+
+# Local runtime, rollback material and host-only deployment notes.
+/backups/
+/dist-pojun
+/96
+*.bak-*
+/DEPLOY-本地部署说明.md
+/.workbuddy/
+/ops/*.log

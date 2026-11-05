@@ -9,6 +9,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 	"unicode/utf8"
 
 	acperm "github.com/Autumn-27/norma/permission"
@@ -45,6 +47,11 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64, tokens
 		// 「这条方向烧了多久」，配合 tokens 判断该不该续派。
 		if wm, ok := p["wall_ms"].(float64); ok && wm > 0 {
 			m["wall_ms"] = int64(wm)
+		}
+		for _, key := range []string{"collaborates_with", "collaboration_angle", "run_budget_seconds", "briefing_ids"} {
+			if value, ok := p[key]; ok {
+				m[key] = value
+			}
 		}
 		if n.Inherited {
 			m["source_task_id"] = n.SourceTaskID
@@ -144,6 +151,82 @@ type ToolSet struct {
 	// 的 guard_attributions 块——planner 由此看到「这个任务被 WAF/拦截打回了 N 次、
 	// 最近被拦的是哪几条命令」并换打法（v0.3.88 体检 N5 + B6 样本补完）。nil = 块省略。
 	attributions func() map[string]any
+
+	// Dispatch gates are enabled only for a Planner.Plan run, never inferred
+	// from a role name. The mutex makes a batch and repeated tool calls share
+	// one successful-creation allowance even if the harness runs calls together.
+	dispatchMu      sync.Mutex
+	dispatchEnabled bool
+	dispatchPolicy  DispatchPolicy
+	dispatchClock   TaskClock
+	dispatchCreated int
+}
+
+// SetDispatchPolicy enables autonomous admission for this single planning run.
+func (t *ToolSet) SetDispatchPolicy(p DispatchPolicy, clock TaskClock) {
+	t.dispatchMu.Lock()
+	defer t.dispatchMu.Unlock()
+	t.dispatchEnabled, t.dispatchPolicy, t.dispatchClock = true, p, clock
+	t.dispatchCreated = 0
+}
+
+func dispatchOpenLimit(slots int) int {
+	if slots < 1 {
+		slots = 1
+	}
+	if slots > 64 {
+		slots = 64
+	}
+	limit := 2 * slots
+	if limit < 4 {
+		limit = 4
+	}
+	return limit
+}
+
+// dispatchOverview exposes the same limits the write path enforces. Query
+// failures are visible; they never masquerade as an empty queue.
+func (t *ToolSet) dispatchOverview() map[string]any {
+	t.dispatchMu.Lock()
+	enabled, p, c, created := t.dispatchEnabled, t.dispatchPolicy, t.dispatchClock, t.dispatchCreated
+	t.dispatchMu.Unlock()
+	if !enabled {
+		return nil
+	}
+	out := map[string]any{
+		"worker_slots": p.WorkerSlots, "open_limit": dispatchOpenLimit(p.WorkerSlots),
+		"round_new_limit": 4, "round_created": created,
+		"collaboration_active_limit": 1, "collaboration_budget_seconds": 600,
+		"round": p.Round, "final": c.Final,
+	}
+	if p.MaxRounds > 0 {
+		left := p.MaxRounds - p.Round
+		if left < 0 {
+			left = 0
+		}
+		out["rounds_left"] = left
+	}
+	if c.DeadlineUnix > 0 {
+		left := time.Until(time.Unix(c.DeadlineUnix, 0)).Seconds()
+		if left < 0 {
+			left = 0
+		}
+		out["seconds_left"] = int64(left)
+	}
+	open, running, collaborating, err := t.ts.IntentAdmissionStats()
+	if err != nil {
+		out["available"] = false
+		return out
+	}
+	normalOpen, err := t.ts.CountOrdinaryOpenIntents()
+	if err != nil {
+		out["available"] = false
+		return out
+	}
+	out["available"], out["open"], out["normal_open"] = true, open, normalOpen
+	out["running"], out["collaborating"] = running, collaborating
+	out["backpressure"] = normalOpen >= dispatchOpenLimit(p.WorkerSlots)
+	return out
 }
 
 // SetAttributions wires the Guard failure-attribution reader (see ToolSet.attributions).
@@ -481,6 +564,9 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		gsum = append(gsum, map[string]any{"id": g.ID, "state": g.State, "text": p["text"]})
 	}
 	out["goals"] = gsum
+	if dispatch := t.dispatchOverview(); dispatch != nil {
+		out["dispatch_budget"] = dispatch
+	}
 	// hints: 人类/主 agent 通过 add_hint 挂上图的战略提示；folded in so the
 	// planner reads them every round when generating intents (否则只写不读).
 	hints, _ := t.ts.ListByKind(db.KindHint, 50)
@@ -1256,6 +1342,11 @@ type intentItem struct {
 	Hypothesis string `json:"hypothesis"`
 	// SuccessCriteria 怎么算成了/没成（可选）：期望拿到的 fact/finding 形态。
 	SuccessCriteria string `json:"success_criteria"`
+	// A collaboration is a distinct, bounded angle on one running intent, not
+	// a continuation and never a request for another worker slot or model.
+	CollaboratesWith   json.RawMessage   `json:"collaborates_with"`
+	CollaborationAngle string            `json:"collaboration_angle"`
+	BriefingIDs        []json.RawMessage `json:"briefing_ids"`
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
@@ -1263,6 +1354,29 @@ type intentItem struct {
 // 节点（不能挂在别的意图/目标/提示上）。顶层全新方向留空 parent_ids，兜底连 origin fact。
 // 这样"每个意图都连到 fact 节点、且是发现驱动而非凭空规划"从创建路径上被强制。
 func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
+	return t.addOneIntentContext(context.Background(), it)
+}
+
+func (t *ToolSet) addOneIntentContext(ctx context.Context, it intentItem) (int64, error) {
+	t.dispatchMu.Lock()
+	defer t.dispatchMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if t.dispatchEnabled {
+		if t.dispatchClock.Final {
+			return 0, fmt.Errorf("dispatch_final: 收官轮只核验已有成果，不生成新意图")
+		}
+		if t.dispatchPolicy.WorkerSlots < 1 {
+			return 0, fmt.Errorf("dispatch_unavailable: 缺少实际worker容量，不猜测派单配额")
+		}
+		if t.dispatchPolicy.MaxRounds > 0 && t.dispatchPolicy.Round >= t.dispatchPolicy.MaxRounds {
+			return 0, fmt.Errorf("dispatch_round_budget: 已到规划轮数上限，不开新方向")
+		}
+		if t.dispatchCreated >= 4 {
+			return 0, fmt.Errorf("dispatch_round_limit: 本轮已成功派出 4 条意图，等待执行反馈再决策")
+		}
+	}
 	summary := clampIntentSummary(it.Summary)
 	if strings.TrimSpace(summary) == "" {
 		return 0, fmt.Errorf("summary 不能为空")
@@ -1300,9 +1414,35 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 			return 0, fmt.Errorf("parent_id %d 是 %q 节点，不能作为意图锚点：意图只能锚在已确认的【事实(fact)/发现(finding)】上，不能挂在意图/目标/提示上；顶层全新方向请留空 parent_ids", pidv, n.Kind)
 		}
 	}
+	briefing := pidList(it.BriefingIDs)
+	if len(briefing) > 6 {
+		return 0, fmt.Errorf("briefing_ids 最多 6 条，传相关事实/发现 id，不传全图")
+	}
+	for _, id := range briefing {
+		n, err := t.ts.GetNodeWithSources(id)
+		if err != nil || n == nil || (n.Kind != db.KindFact && n.Kind != db.KindFinding) {
+			return 0, fmt.Errorf("briefing_id %d 不可用：只允许本任务或直接关联任务的事实/发现", id)
+		}
+	}
+	collaborates := pid(it.CollaboratesWith)
+	if len(it.CollaboratesWith) > 0 && collaborates <= 0 {
+		return 0, fmt.Errorf("collaboration_rejected: collaborates_with 必须是有效正整数")
+	}
+	if collaborates > 0 && !t.dispatchEnabled {
+		return 0, fmt.Errorf("collaboration_requires_planner: 协作评估由运行中的规划轮执行；人工直投请使用普通意图")
+	}
+	if collaborates > 0 && len(it.Continues) > 0 {
+		return 0, fmt.Errorf("协作与接续不能混用：协作是同时验证不同角度，不是重新执行旧会话")
+	}
 	priority := it.Priority
 	if priority == 0 {
 		priority = 5
+	}
+	if priority < 0 {
+		priority = 0
+	}
+	if priority > 10 {
+		priority = 10
 	}
 	// 接续校验 + 代数计算。
 	//
@@ -1323,6 +1463,11 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 		}
 		if cn.Kind != db.KindIntent {
 			return 0, fmt.Errorf("continues %d 是 %q 节点，不能作为接续来源：continues 只能填【意图】id（接续的是一条探索方向）", cid, cn.Kind)
+		}
+		var previous map[string]json.RawMessage
+		_ = json.Unmarshal(cn.Payload, &previous)
+		if _, isCollaboration := previous["collaborates_with"]; isCollaboration {
+			return 0, fmt.Errorf("collaboration_budget: 协作短单不能续代刷新配额；保留结果后回主线决策")
 		}
 		// 接续不能从【正在跑】的意图出发——那是并行竞争。
 		// open 允许：可能是暂停回退的意图，planner 认为需要换角度接续是合理的。
@@ -1355,6 +1500,16 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 		}
 	}
 	payload := map[string]any{"summary": summary}
+	if len(parents) > 0 {
+		payload["parent_ids"] = parents
+	}
+	if len(briefing) > 0 {
+		payload["briefing_ids"] = briefing
+	}
+	if collaborates > 0 {
+		payload["collaborates_with"] = collaborates
+		payload["collaboration_angle"] = strings.TrimSpace(it.CollaborationAngle)
+	}
 	if h := strings.TrimSpace(it.Hypothesis); h != "" {
 		payload["hypothesis"] = h
 	}
@@ -1369,28 +1524,26 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 		payload["continues"] = continues
 		payload["continuation_depth"] = depth
 	}
-	// 派发去重：同任务里已有高度相似的 open/running 意图就不再重复下发——两条并行
-	// worker 干同一件事纯属浪费；planner 能看到提示并改写差异。
-	if existID, existSum, similar, err := t.ts.FindSimilarOpenIntent(summary); err == nil && similar {
-		return 0, fmt.Errorf("已存在高度相似的未完成意图 #%d「%s」，未重复下发；若确实要做不同的事，请在 summary 里写清区别",
-			existID, firstLine(existSum, 60))
+	// Admission, de-duplication, source validation and lineage commit together.
+	// Manual calls retain their existing queue semantics but take the same DB
+	// lock, so they cannot race an autonomous count-then-insert.
+	origin := "planner"
+	if t.resumeTask != nil || t.worker == "main" || t.worker == "human" {
+		origin = "human"
 	}
-	id, err := t.ts.AddIntent(payload, priority, anchors, "planner")
+	admission := db.IntentAdmission{
+		Autonomous: t.dispatchEnabled, CollaboratesWith: collaborates, ParentIDs: parents,
+	}
+	if t.dispatchEnabled {
+		admission.MaxOpen = dispatchOpenLimit(t.dispatchPolicy.WorkerSlots)
+		admission.DeadlineUnix = t.dispatchClock.DeadlineUnix
+	}
+	id, err := t.ts.AddIntentAdmittedContext(ctx, payload, priority, anchors, origin, admission)
 	if err != nil {
 		return 0, err
 	}
-	// upstream lineage: link each (validated) fact/finding parent → this intent, so
-	// "multiple facts combine into one new intent" is expressible.
-	for _, parent := range parents {
-		_ = t.ts.Link(parent, db.RelDerivedFrom, id)
-	}
-	// a top-level intent (no explicit parent) connects to the origin fact, so every
-	// intent still traces back to a fact node — at task start the only fact is the
-	// origin, and the first intents derive from it.
-	if len(parents) == 0 {
-		if origin, _ := t.ts.OriginFactID(); origin > 0 {
-			_ = t.ts.Link(origin, db.RelDerivedFrom, id)
-		}
+	if t.dispatchEnabled {
+		t.dispatchCreated++
 	}
 	return id, nil
 }
@@ -1399,16 +1552,19 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 	return t.writeExpTool("add_intent", "生成【探索方向】写入 frontier，并连入探索链路。意图是开放的探索方向，不是固定类型——用 summary 一句话自由描述要探索/验证/利用什么。\n"+
 		"★优先批量：一轮筛出的多个新方向放进 intents 数组一次提交（比逐条调用省往返）。返回 ids 数组，与 intents 等长同序（失败项 id=0，详情见 errors）。单条则省略 intents 直接给顶层 summary。",
 		obj(map[string]any{
-			"intents":          map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
-			"summary":          str("[单条] 一句话描述这个探索方向：做什么+为什么。已写清方向即可，不依赖资产 id。"),
-			"asset_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
-			"parent_ids":       map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
-			"continues":        map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "【仅当本方向是接续某条旧方向时填】上游【意图】节点 id（0/1/多个）——即本方向要接着哪条被掐断/被收口的意图继续做。**只在 summary 里明说「接续/继续 #NNN」时才填**，且必须与 summary 里提到的意图 id 一致。接续代数有上限（最多接 3 次），超了会被拒绝——到那时请换一种本质不同的打法或转向别的方向，别再接。顶层全新方向留空。"},
-			"priority":         intp("优先级 0-10，默认5。直接逼近目标的利用链步=8-10；新入口面首次探明=6-7；补覆盖/复核=3-4；纯情报=1-2。同轮多意图按价值区分，别全默认 5。"),
-			"hypothesis":       str("【建议填】本方向的假设：依据哪条 fact 的什么推测（引用 fact id）。worker 会以它为验证目标，你下轮判「有没有产出」也有对照锚。"),
-			"success_criteria": str("【建议填】怎么算成了/没成：期望拿到的 fact/finding 形态（如「拿到 admin cookie 的请求响应」/「证实参数 X 不可注入的输出」）。"),
+			"intents":             map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
+			"summary":             str("[单条] 一句话描述这个探索方向：做什么+为什么。已写清方向即可，不依赖资产 id。"),
+			"asset_ids":           map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
+			"parent_ids":          map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
+			"continues":           map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "【仅当本方向是接续某条旧方向时填】上游【意图】节点 id（0/1/多个）——即本方向要接着哪条被掐断/被收口的意图继续做。**只在 summary 里明说「接续/继续 #NNN」时才填**，且必须与 summary 里提到的意图 id 一致。接续代数有上限（最多接 3 次），超了会被拒绝——到那时请换一种本质不同的打法或转向别的方向，别再接。顶层全新方向留空。"},
+			"priority":            intp("优先级 0-10，默认5。直接逼近目标的利用链步=8-10；新入口面首次探明=6-7；补覆盖/复核=3-4；纯情报=1-2。同轮多意图按价值区分，别全默认 5。"),
+			"hypothesis":          str("【建议填】本方向的假设：依据哪条 fact 的什么推测（引用 fact id）。worker 会以它为验证目标，你下轮判「有没有产出」也有对照锚。"),
+			"success_criteria":    str("【建议填】怎么算成了/没成：期望拿到的 fact/finding 形态（如「拿到 admin cookie 的请求响应」/「证实参数 X 不可注入的输出」）。"),
+			"briefing_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "入场经验卡引用，最多6个本任务/直接关联任务的fact或finding；系统自动提炼摘要及证据标记，不复制整个历史。"},
+			"collaborates_with":   idp("【仅规划轮】对本任务正在执行的高价值意图另开不同角度。每源一生最多1次，全任务同时最多1个协作，源须已进入L2评估且priority>=8；不增加worker总数，跨重试/暂停累计最多10分钟。不得与continues混用。"),
+			"collaboration_angle": str("协作的本质差异：与原方向相比验证什么不同假设、为何有价值。协作必须同时提供hypothesis/success_criteria和本图带证据的parent_ids或briefing_ids，并使用原意图已绑定资产的子集；仅L2评估后的原始主线可申请，接续链和协作子单不能再派协作。"),
 		}),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				Intents    []intentItem `json:"intents"`
 				intentItem              // 单条模式：顶层 summary/asset_ids/parent_ids/priority
@@ -1424,7 +1580,7 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 			errs := map[string]string{}
 			createdAny := false
 			for i, it := range items {
-				id, err := t.addOneIntent(it)
+				id, err := t.addOneIntentContext(ctx, it)
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue

@@ -1,0 +1,31 @@
+# 可选：把「工具补齐」做成可重建的镜像，替代 docker commit 的固化方式。
+#
+# 用途：上游发布新版本时，重新基于新镜像补一遍工具，而不是继续用旧容器 commit。
+#   docker build -f Dockerfile.tools -t pojun-local/pojun:tools .
+#   # 然后把 .env 里的 POJUN_IMAGE / POJUN_TAG 指到该镜像，docker compose up -d
+#   或者直接跑 ./pojun-update.sh（自动完成 pull → 重建 → 改 .env → 重启）
+#
+# 注意：Docker 形态下 /api/hostenv/install 不可用（依赖特权助手 pojun-hostd），
+# 所以工具只能这样在镜像层装。容器内可直接访问 GitHub / PyPI / Debian 源。
+ARG BASE=xingchuan1314/pojun:latest
+FROM ${BASE}
+
+# ruby 相关是 evil-winrm 这个 gem 的编译依赖（netexec 从 git 装，纯 Python）
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+      ruby ruby-dev libreadline-dev zlib1g-dev build-essential python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY ops/install_hosttools.py /tmp/ops/install_hosttools.py
+COPY ops/patch_hosttools.py /tmp/ops/patch_hosttools.py
+COPY ops/make_shims.py /tmp/ops/make_shims.py
+
+# 三轮：主装（apt/pip/GitHub Release/SecLists）→ 补漏（资产名对不上的几个 + nikto）
+# → shim（pip 库类工具在 hosttools 目录里靠同名可执行文件判定可用性）
+RUN python3 /tmp/ops/install_hosttools.py \
+ && python3 /tmp/ops/patch_hosttools.py \
+ && python3 /tmp/ops/make_shims.py \
+ && apt-get purge -y -qq build-essential python3-dev ruby-dev \
+ && apt-get autoremove -y -qq && apt-get clean \
+ && rm -rf /root/.cache /tmp/ops /var/lib/apt/lists/*
+
+# msfconsole 不装：Rapid7 官方安装包是交互式的，且体积 >1GB，需要时单独进容器装。

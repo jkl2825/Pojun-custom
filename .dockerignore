@@ -1,4 +1,9 @@
 .git
+.env
+.env.*
+**/*.key
+**/*.pem
+**/*.crt
 **/node_modules
 web/.next
 web/out

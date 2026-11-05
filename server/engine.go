@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -153,7 +154,8 @@ type Engine struct {
 	deadline     sync.Map // taskID -> int64 unix, 绝对截止时刻(首次运行时盖章;0/缺省=不限)
 	stamped      sync.Map // taskID -> bool, first_run_at 是否已盖章(本进程内只盖一次)
 	inflight     sync.Map // taskID -> *int64, 在跑的 planner.Plan + worker.Execute 计数(用于 drain)
-	coordStarted sync.Map // taskID -> bool, deadline 协调器是否已启动(Run/reload 去重)
+	coordMu      sync.Mutex
+	coordStarted sync.Map // taskID -> *deadlineCoordinatorRun，当前一轮协调器(Run/reload 去重)
 
 	// resolve returns a task's dedicated planner/worker (wired by the server as the
 	// authoritative task-router). nil,nil means this task is deliberately unavailable
@@ -166,9 +168,29 @@ type Engine struct {
 }
 
 type taskRuntime struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+	workers int // actual loop count, fixed for this runtime rather than live settings
+}
+
+func (e *Engine) dispatchPolicy(taskID string, round int) agent.DispatchPolicy {
+	e.runtimeMu.Lock()
+	rt := e.runtimes[taskID]
+	slots := 0
+	if rt != nil {
+		slots = rt.workers
+	}
+	e.runtimeMu.Unlock()
+	if slots < 1 {
+		slots = e.m.Workers() // standalone/test planner, before a runtime is installed
+	}
+	cfg := autoFinishConfigFromPG(e.m.pg)
+	maxRounds := 0
+	if cfg.Enabled {
+		maxRounds = cfg.MaxRounds
+	}
+	return agent.DispatchPolicy{WorkerSlots: slots, Round: round, MaxRounds: maxRounds}
 }
 
 type workExecution struct {
@@ -296,7 +318,7 @@ func (e *Engine) StopTask(taskID string) {
 	e.deadline.Delete(taskID)
 	e.stamped.Delete(taskID)
 	e.inflight.Delete(taskID)
-	e.coordStarted.Delete(taskID)
+	e.stopDeadlineCoordinator(taskID)
 	e.deleteMu.Lock()
 	e.deleting.Delete(taskID)
 	e.deleteMu.Unlock()
@@ -851,6 +873,9 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 		return
 	}
 	rt := e.registerTaskRoutines(ctx, t.ID, 1+workers)
+	e.runtimeMu.Lock()
+	rt.workers = workers
+	e.runtimeMu.Unlock()
 	e.deleteMu.RUnlock()
 	// created→running：任务真正开跑后状态列必须与事实一致（此前 bootstrap 准入不写
 	// running，线上任务跑了数小时 DB 里仍是 created）。仅 created 时写，避免覆盖
@@ -975,6 +1000,12 @@ func resetPlannerTimer(timer *time.Timer, d time.Duration) {
 }
 
 func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
+	escalation := time.NewTicker(time.Minute)
+	defer escalation.Stop()
+	e.plannerLoopWithEscalationTicks(ctx, t, escalation.C)
+}
+
+func (e *Engine) plannerLoopWithEscalationTicks(ctx context.Context, t *Task, escalation <-chan time.Time) {
 	interval := plannerHeartbeatInterval(t)
 	// 心跳定时器在 loop 入口臂 = 从任务 start 计时:即使是跳过首轮 planner 的 seed 任务
 	// (Run 里 frontier 非空不 kick 首轮)、这里一直阻塞,心跳也会在「任务 start + interval」
@@ -1000,9 +1031,12 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		}
 		// debounce: coalesce a burst of changes into one planning round
 		timer := time.NewTimer(e.debounce)
+		defer timer.Stop()
 	drain:
 		for {
 			select {
+			case <-ctx.Done():
+				return
 			case <-t.notify:
 			case <-timer.C:
 				break drain
@@ -1104,7 +1138,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// round after plannerRoundTimeout and keeps serving wake-ups. The stuck
 		// goroutine leaks (Go cannot kill one), which is the lesser evil: one
 		// leaked goroutine per stuck round versus a permanently mute planner.
+		dispatch := e.dispatchPolicy(t.ID, round)
 		res := runPlannerRound(roundCtx, func(ctx context.Context) (bool, string, error) {
+			ctx = agent.WithDispatchPolicy(ctx, dispatch)
 			return planner.Plan(ctx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
 		})
 		e.EndLLMCall(t.ID)
@@ -1143,16 +1179,21 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-escalation:
+			// 监督与规划心跳分别计时。持续的 worker 完成事件不能推迟阶梯检查。
+			if !e.IsPaused(t.ID) && !e.IsDeleting(t.ID) && !e.isSettling(t.ID) &&
+				!isTerminalStatus(t.lifecycleSnapshot().Status) {
+				e.checkEscalation(t)
+			}
 		case <-t.notify:
 			runRound("edge") // worker 结束 / finding / kill / resume / seed 首轮
 			e.maybePendingSettle(ctx, t)
+			resetPlannerTimer(heartbeat, interval)
 		case <-heartbeat.C:
-			// 周期兜底:死锁兜底 + 唤醒去监督飞行中的 worker(steer/kill) + 周期复查。
 			runRound("heartbeat")
 			e.maybePendingSettle(ctx, t)
+			resetPlannerTimer(heartbeat, interval)
 		}
-		// 每次唤醒(边沿或心跳)后重臂心跳:任意规划触发都重算这段静置计时。
-		resetPlannerTimer(heartbeat, interval)
 	}
 }
 
@@ -1304,11 +1345,29 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	var reason harness.TerminalReason
 	var wrote agent.WriteCounts
 	var err error
-	if hasChatMessage {
-		reason, wrote, err = worker.ExecuteWithMessage(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, requestID, message)
-	} else {
-		reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
+	var intentFields map[string]json.RawMessage
+	_ = json.Unmarshal(intent.Payload, &intentFields)
+	_, collaboration := intentFields["collaborates_with"]
+	// Charge before the next retry or state transition, not only normal terminal
+	// settlement. Otherwise pause/retry would silently mint another ten minutes.
+	executeAttempt := func() (harness.TerminalReason, agent.WriteCounts, error) {
+		attemptStart := time.Now()
+		var r harness.TerminalReason
+		var w agent.WriteCounts
+		var runErr error
+		if hasChatMessage {
+			r, w, runErr = worker.ExecuteWithMessage(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, requestID, message)
+		} else {
+			r, w, runErr = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
+		}
+		if collaboration {
+			if chargeErr := t.Store.RecordCollaborationRuntime(intent.ID, time.Since(attemptStart).Milliseconds()); chargeErr != nil {
+				return harness.ReasonTimeout, w, fmt.Errorf("collaboration accounting: %w", chargeErr)
+			}
+		}
+		return r, w, runErr
 	}
+	reason, wrote, err = executeAttempt()
 	e.EndLLMCall(t.ID)
 	// model_error 收场 → 额外重跑几次（退避后再试）。仅在意图仍属本 work、任务
 	// 未暂停/未终止/未取消【且未进入收尾】时重试；否则让位给对应分支处理(收尾期不
@@ -1323,11 +1382,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 			break // 退避期间被取消（终止/暂停）→ 交给下方分支处理
 		}
 		e.BeginLLMCall(t.ID)
-		if hasChatMessage {
-			reason, wrote, err = worker.ExecuteWithMessage(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, requestID, message)
-		} else {
-			reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
-		}
+		reason, wrote, err = executeAttempt()
 		e.EndLLMCall(t.ID)
 	}
 	// Capture kill state before detachWork cancels workCtx. kill = this work's

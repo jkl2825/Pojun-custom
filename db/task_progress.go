@@ -87,3 +87,30 @@ SELECT COUNT(*) FILTER (WHERE kind='fact'), COUNT(*) FILTER (WHERE kind='finding
 FROM exploration_nodes WHERE exploration_id=$1`, expID).Scan(&facts, &findings)
 	return
 }
+
+// CountOrdinaryOpenIntents uses the same ordinary-queue predicate as admission;
+// a reserved collaboration slot must not masquerade as a full ordinary queue.
+func (s *ExplorationStore) CountOrdinaryOpenIntents() (int, error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM exploration_nodes
+	WHERE exploration_id=$1 AND kind='intent' AND state='open'
+	AND NOT (payload ? 'collaborates_with')`, s.expID).Scan(&count)
+	return count, err
+}
+
+// RecordCollaborationRuntime charges a bounded collaboration for every finished
+// execution attempt, including paused/cancelled runs. It never resets the total
+// and does not touch ordinary work. Malformed accounting fails closed at the cap.
+func (s *ExplorationStore) RecordCollaborationRuntime(id, elapsedMS int64) error {
+	if elapsedMS < 0 {
+		elapsedMS = 600000
+	}
+	_, err := s.db.Exec(`UPDATE exploration_nodes SET payload=jsonb_set(payload, '{collaboration_wall_ms}',
+	to_jsonb(LEAST(600000::numeric,
+	CASE WHEN jsonb_typeof(payload->'collaboration_wall_ms')='number'
+	THEN CASE WHEN (payload->>'collaboration_wall_ms')::numeric >= 0
+	THEN (payload->>'collaboration_wall_ms')::numeric ELSE 600000::numeric END
+	ELSE 600000::numeric END + $1::numeric)::bigint))
+	WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND payload ? 'collaborates_with'`, elapsedMS, id, s.expID)
+	return err
+}
